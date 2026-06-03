@@ -206,6 +206,7 @@ func (c *Client) SendMessage(msg []byte) ([]byte, error) {
 	copy(framed[4:], msg)
 
 	// Send in MTU-sized chunks
+	log.Printf("BLE: sending message (%d bytes, type=%d) in %d-byte chunks", len(msg), msg[0], c.mtu)
 	for offset := 0; offset < len(framed); offset += c.mtu {
 		end := offset + c.mtu
 		if end > len(framed) {
@@ -264,6 +265,8 @@ func (c *Client) handleNotification(buf []byte) {
 	// Reset
 	c.rxBuf = nil
 	c.rxExpected = 0
+
+	log.Printf("BLE: received response (%d bytes, type=%d)", len(message), message[0])
 
 	// Send to waiting caller
 	select {

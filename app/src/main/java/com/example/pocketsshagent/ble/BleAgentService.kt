@@ -229,6 +229,7 @@ class BleAgentService : Service() {
         Log.d(TAG, "Complete agent message received from $addr (${message.size} bytes)")
 
         agentHandler.handleMessage(message) { response ->
+            Log.d(TAG, "Sending response to $addr (${response.size} bytes)")
             sendResponse(device, response)
         }
     }
@@ -238,10 +239,13 @@ class BleAgentService : Service() {
         val server = gattServer ?: return
         val mtu = deviceMtu[device.address] ?: DEFAULT_MTU
 
+        Log.d(TAG, "sendResponse: ${framedResponse.size} bytes, MTU=$mtu, subscribed=${subscribedDevices.contains(device)}")
+
         val chunks = BleFrameChunker.chunk(framedResponse, mtu)
-        for (chunk in chunks) {
+        for ((i, chunk) in chunks.withIndex()) {
             tx.value = chunk
-            server.notifyCharacteristicChanged(device, tx, false)
+            val result = server.notifyCharacteristicChanged(device, tx, false)
+            Log.d(TAG, "Sent chunk $i/${chunks.size}: ${chunk.size} bytes, result=$result")
         }
     }
 

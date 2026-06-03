@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -26,6 +27,8 @@ func main() {
 		cmdPair(os.Args[2:])
 	case "run":
 		cmdRun(os.Args[2:])
+	case "test":
+		cmdTest(os.Args[2:])
 	case "help":
 		printUsage()
 	default:
@@ -41,6 +44,7 @@ func printUsage() {
 Usage:
   pocket-agent pair   Generate pairing QR code for the phone app
   pocket-agent run    Start the SSH agent proxy (connect via BLE)
+  pocket-agent test   Connect to phone, authenticate, and list keys (diagnostic)
   pocket-agent help   Show this help message
 
 Environment:
@@ -104,6 +108,51 @@ func cmdRun(args []string) {
 	<-sigCh
 
 	fmt.Println("\nShutting down...")
+}
+
+func cmdTest(args []string) {
+	fs := flag.NewFlagSet("test", flag.ExitOnError)
+	configDir := fs.String("config", defaultConfigDir(), "Configuration directory")
+	fs.Parse(args)
+
+	// Load device keys
+	keys, err := pairing.LoadOrGenerateKeys(filepath.Join(*configDir, "keys"))
+	if err != nil {
+		log.Fatalf("Failed to load keys: %v", err)
+	}
+	fmt.Println("[1/4] Device keys loaded")
+
+	// Connect via BLE
+	bleClient := ble.NewClient()
+	if err := bleClient.Connect(); err != nil {
+		log.Fatalf("[2/4] BLE connection failed: %v", err)
+	}
+	defer bleClient.Disconnect()
+	fmt.Println("[2/4] BLE connected")
+
+	// Authenticate
+	if err := bleClient.Authenticate(keys.PrivateKey); err != nil {
+		log.Fatalf("[3/4] Authentication failed: %v", err)
+	}
+	fmt.Println("[3/4] Authenticated with phone")
+
+	// Request identities (list keys)
+	response, err := bleClient.SendMessage([]byte{11}) // SSH_AGENTC_REQUEST_IDENTITIES
+	if err != nil {
+		log.Fatalf("[4/4] List keys failed: %v", err)
+	}
+
+	if len(response) == 0 || response[0] != 12 { // SSH_AGENT_IDENTITIES_ANSWER
+		log.Fatalf("[4/4] Unexpected response type: %d", response[0])
+	}
+
+	// Parse number of keys
+	if len(response) < 5 {
+		log.Fatalf("[4/4] Response too short")
+	}
+	nkeys := int(binary.BigEndian.Uint32(response[1:5]))
+	fmt.Printf("[4/4] Phone has %d key(s) available\n", nkeys)
+	fmt.Println("\nAll tests passed! Proxy can communicate with phone.")
 }
 
 func defaultConfigDir() string {
