@@ -54,6 +54,7 @@ class BleAgentService : Service() {
     private val subscribedDevices = mutableSetOf<BluetoothDevice>()
 
     private var txCharacteristic: BluetoothGattCharacteristic? = null
+    private var isAdvertising = false
 
     // Binder for local binding (e.g., to set AgentCallback from Activity)
     private val binder = LocalBinder()
@@ -164,7 +165,9 @@ class BleAgentService : Service() {
                 agentHandler.resetSession()
                 Log.i(TAG, "Device disconnected: $addr")
             } else if (newState == BluetoothGatt.STATE_CONNECTED) {
-                agentHandler.resetSession()
+                // Don't reset session on connect - STATE_CONNECTED can fire multiple
+                // times during connection (e.g., after MTU negotiation), which would
+                // clear authentication. Session is reset on disconnect or explicit auth.
                 Log.i(TAG, "Device connected: ${device.address}")
             }
         }
@@ -253,6 +256,10 @@ class BleAgentService : Service() {
 
     private fun startAdvertising() {
         if (!hasBluetoothPermission()) return
+        if (isAdvertising) {
+            Log.d(TAG, "Advertising already started, skipping")
+            return
+        }
 
         val adapter = bluetoothManager.adapter ?: return
         advertiser = adapter.bluetoothLeAdvertiser
@@ -275,15 +282,18 @@ class BleAgentService : Service() {
     private fun stopAdvertising() {
         if (!hasBluetoothPermission()) return
         advertiser?.stopAdvertising(advertiseCallback)
+        isAdvertising = false
         Log.i(TAG, "BLE advertising stopped")
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+            isAdvertising = true
             Log.i(TAG, "Advertising started successfully")
         }
 
         override fun onStartFailure(errorCode: Int) {
+            isAdvertising = false
             Log.e(TAG, "Advertising failed with error code: $errorCode")
         }
     }

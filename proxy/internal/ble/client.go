@@ -64,6 +64,11 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("failed to enable BLE adapter: %w", err)
 	}
 
+	// Ensure any previous scan is stopped
+	c.adapter.StopScan()
+	// Give the adapter time to fully stop the scan
+	time.Sleep(50 * time.Millisecond)
+
 	log.Println("Scanning for SSH Agent BLE service...")
 
 	var foundDevice bluetooth.ScanResult
@@ -87,9 +92,9 @@ func (c *Client) Connect() error {
 
 	select {
 	case <-found:
-	case <-time.After(30 * time.Second):
+	case <-time.After(10 * time.Second):
 		c.adapter.StopScan()
-		return fmt.Errorf("timeout: no SSH agent device found")
+		return fmt.Errorf("timeout: no SSH agent device found after 10s scan")
 	}
 
 	log.Printf("Found device: %s (%s)", foundDevice.LocalName(), foundDevice.Address.String())
@@ -125,15 +130,22 @@ func (c *Client) Connect() error {
 	}
 
 	// Subscribe to TX notifications
+	log.Println("Enabling TX notifications...")
 	if err := c.txChar.EnableNotifications(c.handleNotification); err != nil {
 		return fmt.Errorf("failed to enable TX notifications: %w", err)
 	}
+	log.Println("TX notifications enabled successfully, waiting for events...")
+
+	// Delay to ensure notification subscription is fully set up
+	// and the BLE stack is ready to receive notifications.
+	time.Sleep(500 * time.Millisecond)
 
 	c.mu.Lock()
 	c.connected = true
 	c.mu.Unlock()
 
 	log.Println("Connected to SSH Agent BLE service")
+
 	return nil
 }
 
@@ -215,7 +227,12 @@ func (c *Client) SendMessage(msg []byte) ([]byte, error) {
 		chunk := framed[offset:end]
 		_, err := c.rxChar.WriteWithoutResponse(chunk)
 		if err != nil {
-			return nil, fmt.Errorf("failed to write chunk: %w", err)
+			// Mark as disconnected so subsequent operations fail fast instead of
+			// repeatedly attempting writes to a dead connection
+			c.mu.Lock()
+			c.connected = false
+			c.mu.Unlock()
+			return nil, fmt.Errorf("BLE write failed (connection lost?): %w", err)
 		}
 	}
 
@@ -223,15 +240,30 @@ func (c *Client) SendMessage(msg []byte) ([]byte, error) {
 	select {
 	case response := <-c.responseCh:
 		return response, nil
-	case <-time.After(30 * time.Second):
+	case <-time.After(10 * time.Second):
 		return nil, fmt.Errorf("timeout waiting for response")
 	}
+}
+
+// Ping sends a lightweight test message to verify connection health.
+// Used by ConnectionManager for keepalive monitoring.
+func (c *Client) Ping() error {
+	// Send REQUEST_IDENTITIES as a keepalive ping
+	_, err := c.SendMessage([]byte{11})
+	return err
 }
 
 // Disconnect closes the BLE connection.
 func (c *Client) Disconnect() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	
+	// Stop any ongoing scan
+	if c.adapter != nil {
+		c.adapter.StopScan()
+	}
+	
+	// Disconnect device if connected
 	if c.connected {
 		c.device.Disconnect()
 		c.connected = false
@@ -239,10 +271,12 @@ func (c *Client) Disconnect() {
 }
 
 func (c *Client) handleNotification(buf []byte) {
+	log.Printf("BLE: *** handleNotification CALLED with %d bytes ***", len(buf))
 	c.rxMu.Lock()
 	defer c.rxMu.Unlock()
 
 	c.rxBuf = append(c.rxBuf, buf...)
+	log.Printf("BLE: rxBuf now has %d bytes (expected payload=%d)", len(c.rxBuf), c.rxExpected)
 
 	// Need at least 4 bytes for length
 	if len(c.rxBuf) < 4 {

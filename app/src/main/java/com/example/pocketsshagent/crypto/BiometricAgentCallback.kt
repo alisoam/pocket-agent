@@ -24,70 +24,74 @@ class BiometricAgentCallback(
     }
 
     override fun requestBiometricSign(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit) {
-        try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEY_STORE)
-            keyStore.load(null)
-            val privateKey = keyStore.getKey(alias, null) as? PrivateKey
-                ?: run {
-                    Log.e(TAG, "Key not found: $alias")
-                    onResult(null)
-                    return
-                }
+        // BiometricPrompt must be called from the main thread, but this callback
+        // is invoked from the BLE GATT server thread. Dispatch to main thread.
+        activity.runOnUiThread {
+            try {
+                val keyStore = KeyStore.getInstance(ANDROID_KEY_STORE)
+                keyStore.load(null)
+                val privateKey = keyStore.getKey(alias, null) as? PrivateKey
+                    ?: run {
+                        Log.e(TAG, "Key not found: $alias")
+                        onResult(null)
+                        return@runOnUiThread
+                    }
 
-            // Initialize signature — this will require biometric auth
-            val signature = Signature.getInstance("Ed25519")
-            signature.initSign(privateKey)
+                // Initialize signature — this will require biometric auth
+                val signature = Signature.getInstance("Ed25519")
+                signature.initSign(privateKey)
 
-            val cryptoObject = BiometricPrompt.CryptoObject(signature)
+                val cryptoObject = BiometricPrompt.CryptoObject(signature)
 
-            val executor = ContextCompat.getMainExecutor(activity)
-            val biometricPrompt = BiometricPrompt(activity, executor,
-                object : BiometricPrompt.AuthenticationCallback() {
-                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                        try {
-                            val authedSignature = result.cryptoObject?.signature
-                                ?: run {
-                                    Log.e(TAG, "CryptoObject missing after auth")
-                                    onResult(null)
-                                    return
-                                }
-                            authedSignature.update(data)
-                            val signed = authedSignature.sign()
-                            Log.d(TAG, "Signing succeeded for alias: $alias")
-                            onResult(signed)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Signing failed after auth", e)
+                val executor = ContextCompat.getMainExecutor(activity)
+                val biometricPrompt = BiometricPrompt(activity, executor,
+                    object : BiometricPrompt.AuthenticationCallback() {
+                        override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                            try {
+                                val authedSignature = result.cryptoObject?.signature
+                                    ?: run {
+                                        Log.e(TAG, "CryptoObject missing after auth")
+                                        onResult(null)
+                                        return
+                                    }
+                                authedSignature.update(data)
+                                val signed = authedSignature.sign()
+                                Log.d(TAG, "Signing succeeded for alias: $alias")
+                                onResult(signed)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Signing failed after auth", e)
+                                onResult(null)
+                            }
+                        }
+
+                        override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                            Log.w(TAG, "Biometric auth error [$errorCode]: $errString")
                             onResult(null)
                         }
-                    }
 
-                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                        Log.w(TAG, "Biometric auth error [$errorCode]: $errString")
-                        onResult(null)
+                        override fun onAuthenticationFailed() {
+                            Log.w(TAG, "Biometric auth failed (bad finger/face)")
+                            // Don't call onResult — the system allows retries
+                        }
                     }
-
-                    override fun onAuthenticationFailed() {
-                        Log.w(TAG, "Biometric auth failed (bad finger/face)")
-                        // Don't call onResult — the system allows retries
-                    }
-                }
-            )
-
-            val promptInfo = BiometricPrompt.PromptInfo.Builder()
-                .setTitle("SSH Signing Request")
-                .setSubtitle("Approve to sign with key: $alias")
-                .setDescription("An SSH client is requesting a signature.")
-                .setAllowedAuthenticators(
-                    androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                            androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
                 )
-                .build()
 
-            biometricPrompt.authenticate(promptInfo, cryptoObject)
+                val promptInfo = BiometricPrompt.PromptInfo.Builder()
+                    .setTitle("SSH Signing Request")
+                    .setSubtitle("Approve to sign with key: $alias")
+                    .setDescription("An SSH client is requesting a signature.")
+                    .setAllowedAuthenticators(
+                        androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                                androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                    )
+                    .build()
 
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initiate biometric sign", e)
-            onResult(null)
+                biometricPrompt.authenticate(promptInfo, cryptoObject)
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to initiate biometric sign", e)
+                onResult(null)
+            }
         }
     }
 }

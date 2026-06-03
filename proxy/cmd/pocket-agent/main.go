@@ -80,20 +80,15 @@ func cmdRun(args []string) {
 		log.Fatalf("Failed to load keys: %v", err)
 	}
 
-	// Connect to phone via BLE
-	bleClient := ble.NewClient()
-	if err := bleClient.Connect(); err != nil {
-		log.Fatalf("BLE connection failed: %v", err)
+	// Create connection manager (handles automatic reconnection)
+	connMgr := ble.NewConnectionManager(keys.PrivateKey)
+	if err := connMgr.Start(); err != nil {
+		log.Fatalf("Failed to start connection manager: %v", err)
 	}
-	defer bleClient.Disconnect()
-
-	// Authenticate with the phone
-	if err := bleClient.Authenticate(keys.PrivateKey); err != nil {
-		log.Fatalf("Authentication failed: %v", err)
-	}
+	defer connMgr.Stop()
 
 	// Start SSH agent socket server
-	server := agent.NewServer(*socketPath, bleClient)
+	server := agent.NewServer(*socketPath, connMgr)
 	if err := server.Start(); err != nil {
 		log.Fatalf("Failed to start agent server: %v", err)
 	}
@@ -101,6 +96,7 @@ func cmdRun(args []string) {
 
 	fmt.Printf("\nexport SSH_AUTH_SOCK=%s\n\n", *socketPath)
 	fmt.Println("SSH agent proxy is running. Press Ctrl+C to stop.")
+	fmt.Println("Connection manager will automatically reconnect if BLE drops.")
 
 	// Wait for interrupt
 	sigCh := make(chan os.Signal, 1)

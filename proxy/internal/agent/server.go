@@ -101,7 +101,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.mu.Unlock()
 
 		if err != nil {
-			log.Printf("Error from transport: %v", err)
+			log.Printf("Transport error: %v (may be reconnecting)", err)
 			// Send failure response
 			writeAgentMessage(conn, []byte{5}) // SSH_AGENT_FAILURE
 			continue
