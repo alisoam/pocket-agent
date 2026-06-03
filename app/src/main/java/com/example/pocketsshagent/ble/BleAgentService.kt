@@ -26,6 +26,7 @@ import com.example.pocketsshagent.agent.AgentCallback
 import com.example.pocketsshagent.agent.SshAgentHandler
 import com.example.pocketsshagent.agent.SshWireFormat
 import com.example.pocketsshagent.crypto.KeyManager
+import com.example.pocketsshagent.pairing.TrustStore
 
 /**
  * Foreground service that runs a BLE GATT server implementing the SSH agent protocol.
@@ -70,12 +71,13 @@ class BleAgentService : Service() {
      */
     fun setAgentCallback(callback: AgentCallback) {
         this.agentCallback = callback
-        agentHandler = SshAgentHandler(KeyManager(this), callback)
+        agentHandler = SshAgentHandler(KeyManager(this), callback, TrustStore(this))
     }
 
     override fun onCreate() {
         super.onCreate()
         bluetoothManager = getSystemService(BluetoothManager::class.java)
+        val trustStore = TrustStore(this)
         agentHandler = SshAgentHandler(KeyManager(this), object : AgentCallback {
             override fun requestBiometricSign(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit) {
                 // Delegate to the activity-provided callback, or deny
@@ -87,7 +89,7 @@ class BleAgentService : Service() {
                     onResult(null)
                 }
             }
-        })
+        }, trustStore)
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
@@ -159,8 +161,10 @@ class BleAgentService : Service() {
                 deviceAssemblers.remove(addr)
                 deviceMtu.remove(addr)
                 subscribedDevices.remove(device)
+                agentHandler.resetSession()
                 Log.i(TAG, "Device disconnected: $addr")
             } else if (newState == BluetoothGatt.STATE_CONNECTED) {
+                agentHandler.resetSession()
                 Log.i(TAG, "Device connected: ${device.address}")
             }
         }

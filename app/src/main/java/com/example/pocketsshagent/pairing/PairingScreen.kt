@@ -133,6 +133,7 @@ fun PairingScreen(onBack: () -> Unit) {
                         onRemove = {
                             trustStore.removeDevice(device.publicKey)
                             devices = trustStore.getAllDevices()
+                            Toast.makeText(context, "Removed: ${device.label}", Toast.LENGTH_SHORT).show()
                         }
                     )
                     HorizontalDivider()
