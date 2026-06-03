@@ -51,6 +51,7 @@ import com.example.pocketsshagent.ble.BleAgentService
 import com.example.pocketsshagent.crypto.BiometricAgentCallback
 import com.example.pocketsshagent.crypto.KeyManager
 import com.example.pocketsshagent.model.KeyMetadata
+import com.example.pocketsshagent.pairing.PairingScreen
 import com.example.pocketsshagent.ui.theme.PocketSSHAgentTheme
 
 class MainActivity : FragmentActivity() {
@@ -99,7 +100,11 @@ class MainActivity : FragmentActivity() {
 
         setContent {
             PocketSSHAgentTheme {
-                KeyListScreen()
+                var currentScreen by remember { mutableStateOf("keys") }
+                when (currentScreen) {
+                    "keys" -> KeyListScreen(onNavigateToPairing = { currentScreen = "pairing" })
+                    "pairing" -> PairingScreen(onBack = { currentScreen = "keys" })
+                }
             }
         }
     }
@@ -125,7 +130,7 @@ class MainActivity : FragmentActivity() {
 }
 
 @Composable
-fun KeyListScreen() {
+fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
     val context = LocalContext.current.applicationContext
     val keyManager = remember { KeyManager(context) }
     var keys by remember { mutableStateOf(emptyList<KeyMetadata>()) }
@@ -150,11 +155,20 @@ fun KeyListScreen() {
                 .padding(innerPadding)
                 .padding(16.dp)
         ) {
-            Text(
-                text = "SSH Keys",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "SSH Keys",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                TextButton(onClick = onNavigateToPairing) {
+                    Text("Devices")
+                }
+            }
             Spacer(modifier = Modifier.height(12.dp))
             if (keys.isEmpty()) {
                 Text(text = "No keys yet. Create one to get started.")
