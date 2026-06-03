@@ -1,12 +1,18 @@
 package com.example.pocketsshagent
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ComponentName
+import android.content.Intent
+import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.IBinder
 import android.widget.Toast
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -39,19 +45,81 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.fragment.app.FragmentActivity
 import com.example.pocketsshagent.agent.SshPublicKeyUtils
+import com.example.pocketsshagent.ble.BleAgentService
+import com.example.pocketsshagent.crypto.BiometricAgentCallback
 import com.example.pocketsshagent.crypto.KeyManager
 import com.example.pocketsshagent.model.KeyMetadata
 import com.example.pocketsshagent.ui.theme.PocketSSHAgentTheme
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
+
+    private var bleService: BleAgentService? = null
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as BleAgentService.LocalBinder
+            bleService = binder.getService()
+            bleService?.setAgentCallback(BiometricAgentCallback(this@MainActivity))
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            bleService = null
+        }
+    }
+
+    private val requiredPermissions = arrayOf(
+        Manifest.permission.BLUETOOTH_ADVERTISE,
+        Manifest.permission.BLUETOOTH_CONNECT,
+        Manifest.permission.POST_NOTIFICATIONS
+    )
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        val allGranted = results.values.all { it }
+        if (allGranted) {
+            startBleService()
+        } else {
+            Toast.makeText(this, "Bluetooth permissions required for SSH agent", Toast.LENGTH_LONG).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Request permissions then start service
+        if (hasRequiredPermissions()) {
+            startBleService()
+        } else {
+            permissionLauncher.launch(requiredPermissions)
+        }
+
         setContent {
             PocketSSHAgentTheme {
                 KeyListScreen()
             }
+        }
+    }
+
+    override fun onDestroy() {
+        if (bleService != null) {
+            unbindService(serviceConnection)
+        }
+        super.onDestroy()
+    }
+
+    private fun startBleService() {
+        val serviceIntent = Intent(this, BleAgentService::class.java)
+        startForegroundService(serviceIntent)
+        bindService(serviceIntent, serviceConnection, BIND_AUTO_CREATE)
+    }
+
+    private fun hasRequiredPermissions(): Boolean {
+        return requiredPermissions.all {
+            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
         }
     }
 }
