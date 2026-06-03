@@ -1,0 +1,314 @@
+package com.example.pocketsshagent.ble
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothGattServer
+import android.bluetooth.BluetoothGattServerCallback
+import android.bluetooth.BluetoothGattService
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.AdvertiseCallback
+import android.bluetooth.le.AdvertiseData
+import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.BluetoothLeAdvertiser
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Binder
+import android.os.IBinder
+import android.os.ParcelUuid
+import android.util.Log
+import com.example.pocketsshagent.agent.AgentCallback
+import com.example.pocketsshagent.agent.SshAgentHandler
+import com.example.pocketsshagent.agent.SshWireFormat
+import com.example.pocketsshagent.crypto.KeyManager
+
+/**
+ * Foreground service that runs a BLE GATT server implementing the SSH agent protocol.
+ *
+ * Clients (desktop proxy) connect via BLE, write agent requests to the RX characteristic,
+ * and receive responses via notifications on the TX characteristic.
+ */
+class BleAgentService : Service() {
+
+    companion object {
+        private const val TAG = "BleAgentService"
+        private const val NOTIFICATION_CHANNEL_ID = "ssh_agent_channel"
+        private const val NOTIFICATION_ID = 1
+        private const val DEFAULT_MTU = 20
+    }
+
+    private lateinit var bluetoothManager: BluetoothManager
+    private var gattServer: BluetoothGattServer? = null
+    private var advertiser: BluetoothLeAdvertiser? = null
+    private lateinit var agentHandler: SshAgentHandler
+
+    // Per-device state
+    private val deviceAssemblers = mutableMapOf<String, BleFrameAssembler>()
+    private val deviceMtu = mutableMapOf<String, Int>()
+    private val subscribedDevices = mutableSetOf<BluetoothDevice>()
+
+    private var txCharacteristic: BluetoothGattCharacteristic? = null
+
+    // Binder for local binding (e.g., to set AgentCallback from Activity)
+    private val binder = LocalBinder()
+    private var agentCallback: AgentCallback? = null
+
+    inner class LocalBinder : Binder() {
+        fun getService(): BleAgentService = this@BleAgentService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    /**
+     * Set the callback used for biometric signing prompts.
+     * Must be called from the Activity after binding.
+     */
+    fun setAgentCallback(callback: AgentCallback) {
+        this.agentCallback = callback
+        agentHandler = SshAgentHandler(KeyManager(this), callback)
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        bluetoothManager = getSystemService(BluetoothManager::class.java)
+        agentHandler = SshAgentHandler(KeyManager(this), object : AgentCallback {
+            override fun requestBiometricSign(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit) {
+                // Delegate to the activity-provided callback, or deny
+                val cb = agentCallback
+                if (cb != null) {
+                    cb.requestBiometricSign(alias, data, onResult)
+                } else {
+                    Log.w(TAG, "No AgentCallback set, denying sign request")
+                    onResult(null)
+                }
+            }
+        })
+
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildNotification())
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startGattServer()
+        startAdvertising()
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        stopAdvertising()
+        gattServer?.close()
+        gattServer = null
+        subscribedDevices.clear()
+        deviceAssemblers.clear()
+        deviceMtu.clear()
+        super.onDestroy()
+    }
+
+    // ─── GATT Server ────────────────────────────────────────────────────────────
+
+    private fun startGattServer() {
+        if (!hasBluetoothPermission()) {
+            Log.e(TAG, "Missing Bluetooth permissions")
+            return
+        }
+
+        gattServer = bluetoothManager.openGattServer(this, gattCallback)
+        val service = BluetoothGattService(
+            BleUuids.SSH_AGENT_SERVICE,
+            BluetoothGattService.SERVICE_TYPE_PRIMARY
+        )
+
+        // RX characteristic: client writes requests here
+        val rxChar = BluetoothGattCharacteristic(
+            BleUuids.AGENT_RX,
+            BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+            BluetoothGattCharacteristic.PERMISSION_WRITE
+        )
+
+        // TX characteristic: server notifies responses here
+        val txChar = BluetoothGattCharacteristic(
+            BleUuids.AGENT_TX,
+            BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+            BluetoothGattCharacteristic.PERMISSION_READ
+        )
+        val cccd = BluetoothGattDescriptor(
+            BleUuids.CCCD,
+            BluetoothGattDescriptor.PERMISSION_WRITE or BluetoothGattDescriptor.PERMISSION_READ
+        )
+        txChar.addDescriptor(cccd)
+        txCharacteristic = txChar
+
+        service.addCharacteristic(rxChar)
+        service.addCharacteristic(txChar)
+
+        gattServer?.addService(service)
+        Log.i(TAG, "GATT server started")
+    }
+
+    private val gattCallback = object : BluetoothGattServerCallback() {
+
+        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+                val addr = device.address
+                deviceAssemblers.remove(addr)
+                deviceMtu.remove(addr)
+                subscribedDevices.remove(device)
+                Log.i(TAG, "Device disconnected: $addr")
+            } else if (newState == BluetoothGatt.STATE_CONNECTED) {
+                Log.i(TAG, "Device connected: ${device.address}")
+            }
+        }
+
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            // Effective payload = MTU - 3 (ATT header)
+            deviceMtu[device.address] = mtu - 3
+            Log.d(TAG, "MTU changed for ${device.address}: $mtu (payload: ${mtu - 3})")
+        }
+
+        override fun onCharacteristicWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            characteristic: BluetoothGattCharacteristic,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray?
+        ) {
+            if (characteristic.uuid == BleUuids.AGENT_RX && value != null) {
+                handleIncomingChunk(device, value)
+                if (responseNeeded) {
+                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+                }
+            } else {
+                if (responseNeeded) {
+                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, 0, null)
+                }
+            }
+        }
+
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            descriptor: BluetoothGattDescriptor,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray?
+        ) {
+            if (descriptor.uuid == BleUuids.CCCD) {
+                if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+                    subscribedDevices.add(device)
+                    Log.d(TAG, "Device subscribed to TX: ${device.address}")
+                } else {
+                    subscribedDevices.remove(device)
+                    Log.d(TAG, "Device unsubscribed from TX: ${device.address}")
+                }
+                if (responseNeeded) {
+                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+                }
+            }
+        }
+    }
+
+    private fun handleIncomingChunk(device: BluetoothDevice, chunk: ByteArray) {
+        val addr = device.address
+        val assembler = deviceAssemblers.getOrPut(addr) { BleFrameAssembler() }
+        val message = assembler.feed(chunk) ?: return
+
+        // Complete message received — process it
+        Log.d(TAG, "Complete agent message received from $addr (${message.size} bytes)")
+
+        agentHandler.handleMessage(message) { response ->
+            sendResponse(device, response)
+        }
+    }
+
+    private fun sendResponse(device: BluetoothDevice, framedResponse: ByteArray) {
+        val tx = txCharacteristic ?: return
+        val server = gattServer ?: return
+        val mtu = deviceMtu[device.address] ?: DEFAULT_MTU
+
+        val chunks = BleFrameChunker.chunk(framedResponse, mtu)
+        for (chunk in chunks) {
+            tx.value = chunk
+            server.notifyCharacteristicChanged(device, tx, false)
+        }
+    }
+
+    // ─── BLE Advertising ────────────────────────────────────────────────────────
+
+    private fun startAdvertising() {
+        if (!hasBluetoothPermission()) return
+
+        val adapter = bluetoothManager.adapter ?: return
+        advertiser = adapter.bluetoothLeAdvertiser
+
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setConnectable(true)
+            .setTimeout(0) // Advertise indefinitely
+            .build()
+
+        val data = AdvertiseData.Builder()
+            .setIncludeDeviceName(true)
+            .addServiceUuid(ParcelUuid(BleUuids.SSH_AGENT_SERVICE))
+            .build()
+
+        advertiser?.startAdvertising(settings, data, advertiseCallback)
+        Log.i(TAG, "BLE advertising started")
+    }
+
+    private fun stopAdvertising() {
+        if (!hasBluetoothPermission()) return
+        advertiser?.stopAdvertising(advertiseCallback)
+        Log.i(TAG, "BLE advertising stopped")
+    }
+
+    private val advertiseCallback = object : AdvertiseCallback() {
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+            Log.i(TAG, "Advertising started successfully")
+        }
+
+        override fun onStartFailure(errorCode: Int) {
+            Log.e(TAG, "Advertising failed with error code: $errorCode")
+        }
+    }
+
+    // ─── Notification ───────────────────────────────────────────────────────────
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            NOTIFICATION_CHANNEL_ID,
+            "SSH Agent",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "SSH Agent BLE service is active"
+        }
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(channel)
+    }
+
+    private fun buildNotification(): Notification {
+        return Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("SSH Agent Active")
+            .setContentText("Listening for BLE connections")
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setOngoing(true)
+            .build()
+    }
+
+    // ─── Permissions ────────────────────────────────────────────────────────────
+
+    private fun hasBluetoothPermission(): Boolean {
+        return checkSelfPermission(android.Manifest.permission.BLUETOOTH_ADVERTISE) ==
+                PackageManager.PERMISSION_GRANTED &&
+                checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
+                PackageManager.PERMISSION_GRANTED
+    }
+}
