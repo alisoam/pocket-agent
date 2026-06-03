@@ -67,14 +67,41 @@ object SshWireFormat {
 
     /**
      * Extract the raw 32-byte Ed25519 public key from an X.509/PKIX encoded key.
-     * X.509 Ed25519 format: 12-byte header + 32-byte key.
+     * Standard X.509 Ed25519 SubjectPublicKeyInfo is 44 bytes:
+     *   30 2a 30 05 06 03 2b 65 70 03 21 00 <32 bytes>
+     * But some implementations may vary, so we search for the OID and extract accordingly.
      */
     fun extractRawEd25519PublicKey(x509Encoded: ByteArray): ByteArray {
-        // Ed25519 X.509 SubjectPublicKeyInfo is always 44 bytes:
-        // 30 2a 30 05 06 03 2b 65 70 03 21 00 <32 bytes>
-        require(x509Encoded.size == 44) {
-            "Unexpected X.509 Ed25519 public key size: ${x509Encoded.size}"
+        // Standard 44-byte format
+        if (x509Encoded.size == 44) {
+            return x509Encoded.copyOfRange(12, 44)
         }
-        return x509Encoded.copyOfRange(12, 44)
+
+        // Search for Ed25519 OID: 06 03 2b 65 70
+        val oid = byteArrayOf(0x06, 0x03, 0x2b, 0x65, 0x70)
+        val oidIndex = findSubArray(x509Encoded, oid)
+        if (oidIndex >= 0) {
+            // The raw key is the last 32 bytes of the encoding
+            val keyStart = x509Encoded.size - 32
+            if (keyStart > 0) {
+                return x509Encoded.copyOfRange(keyStart, x509Encoded.size)
+            }
+        }
+
+        // Fallback: assume last 32 bytes are the key
+        require(x509Encoded.size >= 32) {
+            "Encoded key too short: ${x509Encoded.size} bytes"
+        }
+        return x509Encoded.copyOfRange(x509Encoded.size - 32, x509Encoded.size)
+    }
+
+    private fun findSubArray(haystack: ByteArray, needle: ByteArray): Int {
+        outer@ for (i in 0..haystack.size - needle.size) {
+            for (j in needle.indices) {
+                if (haystack[i + j] != needle[j]) continue@outer
+            }
+            return i
+        }
+        return -1
     }
 }
