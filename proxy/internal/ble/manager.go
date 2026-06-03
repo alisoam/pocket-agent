@@ -114,17 +114,19 @@ func (cm *ConnectionManager) Stop() {
 // SendMessage sends an SSH agent message to the phone and returns the response.
 // Implements the agent.Transport interface.
 //
-// Behavior:
-// - If connected: sends immediately
-// - If not connected: fails immediately (SSH client will retry)
+// If not yet connected, waits for reconnection before sending. Sign requests
+// (type=13) get a longer wait because they also require biometric approval.
 func (cm *ConnectionManager) SendMessage(msg []byte) ([]byte, error) {
-	cm.stateMu.RLock()
-	state := cm.state
-	cm.stateMu.RUnlock()
-
-	// Only send if fully connected
-	if state != StateConnected {
-		return nil, fmt.Errorf("BLE transport unavailable: %s", state.String())
+	if !cm.IsConnected() {
+		// Sign requests need extra time: BLE reconnect + app foreground + biometric.
+		waitTimeout := 15 * time.Second
+		if len(msg) > 0 && msg[0] == 13 { // SSH_AGENTC_SIGN_REQUEST
+			waitTimeout = 45 * time.Second
+		}
+		log.Printf("BLE not connected (%s), waiting up to %v for reconnection...", cm.GetState(), waitTimeout)
+		if err := cm.WaitUntilConnected(waitTimeout); err != nil {
+			return nil, fmt.Errorf("BLE transport unavailable: %s (timed out after %v)", cm.GetState(), waitTimeout)
+		}
 	}
 
 	// Send the message
