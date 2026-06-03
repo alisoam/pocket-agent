@@ -75,6 +75,12 @@ class KeyManager(private val context: Context) {
         )
     }
 
+    fun getKeyAlgorithm(alias: String): String? {
+        val keyStore = KeyStore.getInstance(ANDROID_KEY_STORE)
+        keyStore.load(null)
+        return keyStore.getCertificate(alias)?.publicKey?.algorithm
+    }
+
     private fun getHardwareBackedStatus(alias: String): Boolean {
         val factory = KeyFactory.getInstance(
             ALGORITHM_ED25519,

@@ -8,27 +8,10 @@ import java.security.KeyFactory
 import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
 
-/**
- * Callback interface for operations requiring user interaction.
- */
 interface AgentCallback {
-    /**
-     * Called when a sign request requires biometric approval.
-     * The implementation should prompt the user and call [onResult] with the
-     * signature bytes on approval, or null on denial/failure.
-     *
-     * @param alias The key alias to sign with.
-     * @param data The data to be signed.
-     * @param onResult Callback with signature bytes or null.
-     */
     fun requestBiometricSign(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit)
 }
 
-/**
- * Core SSH agent protocol handler.
- * Processes incoming agent messages and produces responses.
- * Requires session authentication before allowing agent operations.
- */
 class SshAgentHandler(
     private val keyManager: KeyManager,
     private val callback: AgentCallback,
@@ -38,22 +21,12 @@ class SshAgentHandler(
         private const val TAG = "SshAgentHandler"
     }
 
-    // Per-session authentication state
     private var authenticated = false
 
-    /**
-     * Reset authentication state (call when a device disconnects).
-     */
     fun resetSession() {
         authenticated = false
     }
 
-    /**
-     * Process a raw agent message (without length prefix).
-     * Calls [onResponse] with the framed response message.
-     *
-     * Note: This is async because SIGN_REQUEST requires biometric approval.
-     */
     fun handleMessage(message: ByteArray, onResponse: (ByteArray) -> Unit) {
         if (message.isEmpty()) {
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
@@ -61,29 +34,21 @@ class SshAgentHandler(
         }
 
         when (AgentMessageParser.messageType(message)) {
-            AgentMessageType.POCKET_AUTH_REQUEST -> {
-                handleAuthRequest(message, onResponse)
-            }
+            AgentMessageType.POCKET_AUTH_REQUEST -> handleAuthRequest(message, onResponse)
             AgentMessageType.SSH_AGENTC_REQUEST_IDENTITIES -> {
                 if (!requireAuth(onResponse)) return
-                val response = handleRequestIdentities()
-                onResponse(SshWireFormat.frameMessage(response))
+                onResponse(SshWireFormat.frameMessage(handleRequestIdentities()))
             }
             AgentMessageType.SSH_AGENTC_SIGN_REQUEST -> {
                 if (!requireAuth(onResponse)) return
                 handleSignRequest(message, onResponse)
             }
-            else -> {
-                onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
-            }
+            else -> onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
         }
     }
 
     private fun requireAuth(onResponse: (ByteArray) -> Unit): Boolean {
-        if (trustStore == null) {
-            // No trust store configured — skip auth (backwards compatible)
-            return true
-        }
+        if (trustStore == null) return true
         if (!authenticated) {
             Log.w(TAG, "Rejecting request: session not authenticated")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authFailure()))
@@ -101,7 +66,6 @@ class SshAgentHandler(
             return
         }
 
-        // Verify signature over nonce using the provided public key
         val verified = try {
             val keySpec = X509EncodedKeySpec(authRequest.publicKey)
             val keyFactory = KeyFactory.getInstance("Ed25519")
@@ -121,15 +85,13 @@ class SshAgentHandler(
             return
         }
 
-        // Check if this public key is in the trust store
         val publicKeyBase64 = Base64.encodeToString(authRequest.publicKey, Base64.NO_WRAP)
         if (trustStore != null && !trustStore.isTrusted(publicKeyBase64)) {
-            Log.w(TAG, "Auth request: device not trusted (may have been removed)")
+            Log.w(TAG, "Auth request: device not trusted")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authFailure()))
             return
         }
 
-        // Authentication successful
         authenticated = true
         trustStore?.updateLastSeen(publicKeyBase64)
         Log.i(TAG, "Session authenticated for device: $publicKeyBase64")
@@ -141,11 +103,28 @@ class SshAgentHandler(
         val keyPairs = keys.mapNotNull { metadata ->
             try {
                 val publicKey = keyManager.getPublicKey(metadata.alias)
-                val rawKey = SshWireFormat.extractRawEd25519PublicKey(publicKey.encoded)
-                val keyBlob = SshWireFormat.encodeEd25519PublicKey(rawKey)
-                val comment = metadata.label
-                keyBlob to comment
-            } catch (_: Exception) {
+                val encoded = publicKey.encoded
+                val keyBlob = when {
+                    SshWireFormat.isEd25519PublicKey(encoded) -> {
+                        Log.d(TAG, "Key '${metadata.label}': Ed25519")
+                        SshWireFormat.encodeEd25519PublicKey(
+                            SshWireFormat.extractRawEd25519PublicKey(encoded)
+                        )
+                    }
+                    SshWireFormat.isP256PublicKey(encoded) -> {
+                        Log.d(TAG, "Key '${metadata.label}': ECDSA P-256")
+                        SshWireFormat.encodeEcdsaP256PublicKey(
+                            SshWireFormat.extractRawP256PublicKey(encoded)
+                        )
+                    }
+                    else -> {
+                        Log.w(TAG, "Key '${metadata.label}': unknown type (encodedLen=${encoded.size}), skipping")
+                        return@mapNotNull null
+                    }
+                }
+                keyBlob to metadata.label
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load key '${metadata.label}': $e")
                 null
             }
         }
@@ -160,36 +139,45 @@ class SshAgentHandler(
             return
         }
 
-        // Find the key alias matching the requested key blob
-        val alias = findKeyAlias(signRequest.keyBlob)
-        if (alias == null) {
+        val (alias, isP256) = findKeyAlias(signRequest.keyBlob) ?: run {
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
         }
 
-        // Request biometric approval and signing
         callback.requestBiometricSign(alias, signRequest.data) { signature ->
             if (signature != null) {
                 keyManager.updateLastUsed(alias)
-                onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.signResponse(signature)))
+                val response = if (isP256) {
+                    AgentMessageBuilder.signResponseEcdsaP256(signature)
+                } else {
+                    AgentMessageBuilder.signResponseEd25519(signature)
+                }
+                onResponse(SshWireFormat.frameMessage(response))
             } else {
                 onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             }
         }
     }
 
-    /**
-     * Find the key alias whose public key blob matches the requested blob.
-     */
-    private fun findKeyAlias(requestedKeyBlob: ByteArray): String? {
-        val keys = keyManager.listKeys()
-        for (metadata in keys) {
+    /** Returns (alias, isP256) for the key matching the requested blob, or null. */
+    private fun findKeyAlias(requestedKeyBlob: ByteArray): Pair<String, Boolean>? {
+        for (metadata in keyManager.listKeys()) {
             try {
                 val publicKey = keyManager.getPublicKey(metadata.alias)
-                val rawKey = SshWireFormat.extractRawEd25519PublicKey(publicKey.encoded)
-                val keyBlob = SshWireFormat.encodeEd25519PublicKey(rawKey)
+                val encoded = publicKey.encoded
+                val keyBlob = when {
+                    SshWireFormat.isEd25519PublicKey(encoded) ->
+                        SshWireFormat.encodeEd25519PublicKey(
+                            SshWireFormat.extractRawEd25519PublicKey(encoded)
+                        )
+                    SshWireFormat.isP256PublicKey(encoded) ->
+                        SshWireFormat.encodeEcdsaP256PublicKey(
+                            SshWireFormat.extractRawP256PublicKey(encoded)
+                        )
+                    else -> continue
+                }
                 if (keyBlob.contentEquals(requestedKeyBlob)) {
-                    return metadata.alias
+                    return metadata.alias to SshWireFormat.isP256PublicKey(encoded)
                 }
             } catch (_: Exception) {
                 continue

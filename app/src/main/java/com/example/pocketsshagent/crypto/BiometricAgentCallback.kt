@@ -5,15 +5,11 @@ import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.example.pocketsshagent.agent.AgentCallback
+import com.example.pocketsshagent.agent.SshWireFormat
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.Signature
 
-/**
- * AgentCallback implementation that uses BiometricPrompt to authorize
- * every signing operation. The Keystore key requires user authentication,
- * so the BiometricPrompt's CryptoObject unlocks it for a single use.
- */
 class BiometricAgentCallback(
     private val activity: FragmentActivity
 ) : AgentCallback {
@@ -24,12 +20,11 @@ class BiometricAgentCallback(
     }
 
     override fun requestBiometricSign(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit) {
-        // BiometricPrompt must be called from the main thread, but this callback
-        // is invoked from the BLE GATT server thread. Dispatch to main thread.
         activity.runOnUiThread {
             try {
                 val keyStore = KeyStore.getInstance(ANDROID_KEY_STORE)
                 keyStore.load(null)
+
                 val privateKey = keyStore.getKey(alias, null) as? PrivateKey
                     ?: run {
                         Log.e(TAG, "Key not found: $alias")
@@ -37,26 +32,35 @@ class BiometricAgentCallback(
                         return@runOnUiThread
                     }
 
-                // Initialize signature — this will require biometric auth
-                val signature = Signature.getInstance("Ed25519")
+                // Determine signing algorithm from the public key's X.509 OID.
+                // NONEwithECDSA for P-256: OpenSSH sends a pre-hashed SHA-256 digest
+                // via PKCS#11 CKM_ECDSA, so we sign raw without re-hashing.
+                val pubEncoded = keyStore.getCertificate(alias)?.publicKey?.encoded
+                val sigAlgo = when {
+                    pubEncoded != null && SshWireFormat.isP256PublicKey(pubEncoded) -> "NONEwithECDSA"
+                    else -> "Ed25519"
+                }
+                Log.d(TAG, "Signing with $sigAlgo for alias $alias")
+
+                val signature = Signature.getInstance(sigAlgo)
                 signature.initSign(privateKey)
 
                 val cryptoObject = BiometricPrompt.CryptoObject(signature)
-
                 val executor = ContextCompat.getMainExecutor(activity)
+
                 val biometricPrompt = BiometricPrompt(activity, executor,
                     object : BiometricPrompt.AuthenticationCallback() {
                         override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                             try {
-                                val authedSignature = result.cryptoObject?.signature
+                                val authedSig = result.cryptoObject?.signature
                                     ?: run {
                                         Log.e(TAG, "CryptoObject missing after auth")
                                         onResult(null)
                                         return
                                     }
-                                authedSignature.update(data)
-                                val signed = authedSignature.sign()
-                                Log.d(TAG, "Signing succeeded for alias: $alias")
+                                authedSig.update(data)
+                                val signed = authedSig.sign()
+                                Log.d(TAG, "Signing succeeded ($sigAlgo) for alias: $alias, sigLen=${signed.size}")
                                 onResult(signed)
                             } catch (e: Exception) {
                                 Log.e(TAG, "Signing failed after auth", e)
@@ -71,7 +75,6 @@ class BiometricAgentCallback(
 
                         override fun onAuthenticationFailed() {
                             Log.w(TAG, "Biometric auth failed (bad finger/face)")
-                            // Don't call onResult — the system allows retries
                         }
                     }
                 )

@@ -98,7 +98,16 @@ func (cm *ConnectionManager) Start() error {
 // Stop gracefully shuts down the connection manager.
 // Waits for all goroutines to terminate.
 func (cm *ConnectionManager) Stop() {
-	close(cm.stopCh)
+	// Close stop channel if not already closed
+	select {
+	case <-cm.stopCh:
+		// Already stopped
+		return
+	default:
+		close(cm.stopCh)
+	}
+	
+	// Wait for connection loop to finish
 	<-cm.stoppedCh
 }
 
@@ -144,6 +153,23 @@ func (cm *ConnectionManager) IsConnected() bool {
 	cm.stateMu.RLock()
 	defer cm.stateMu.RUnlock()
 	return cm.state == StateConnected
+}
+
+// WaitUntilConnected blocks until connected or timeout expires.
+func (cm *ConnectionManager) WaitUntilConnected(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-cm.stopCh:
+			return fmt.Errorf("connection manager stopped")
+		default:
+		}
+		if cm.IsConnected() {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for BLE connection")
 }
 
 // GetState returns the current connection state.

@@ -212,6 +212,14 @@ func (c *Client) SendMessage(msg []byte) ([]byte, error) {
 	}
 	c.mu.Unlock()
 
+	// Drain any stale response left from a previous operation (e.g. a late
+	// IDENTITIES_ANSWER arriving after LoadKeys already returned).
+	select {
+	case stale := <-c.responseCh:
+		log.Printf("BLE: drained stale response (type=%d, %d bytes) before sending", stale[0], len(stale))
+	default:
+	}
+
 	// Frame the message (4-byte length prefix + payload)
 	framed := make([]byte, 4+len(msg))
 	binary.BigEndian.PutUint32(framed[0:4], uint32(len(msg)))
@@ -255,6 +263,10 @@ func (c *Client) Ping() error {
 
 // Disconnect closes the BLE connection.
 func (c *Client) Disconnect() {
+	if c == nil {
+		return
+	}
+	
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	

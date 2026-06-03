@@ -117,16 +117,22 @@ object AgentMessageBuilder {
     }
 
     /**
-     * Build SSH_AGENT_SIGN_RESPONSE.
-     * Format: byte type | string signature
+     * Build SSH_AGENT_SIGN_RESPONSE for Ed25519.
      */
-    fun signResponse(signature: ByteArray): ByteArray {
-        val body = mutableListOf<Byte>()
-        body.add(AgentMessageType.SSH_AGENT_SIGN_RESPONSE)
-        // The signature is wrapped in an SSH string containing the encoded signature blob
+    fun signResponseEd25519(signature: ByteArray): ByteArray {
         val encodedSig = SshWireFormat.encodeEd25519Signature(signature)
-        body.addAll(SshWireFormat.encodeString(encodedSig).toList())
-        return body.toByteArray()
+        return byteArrayOf(AgentMessageType.SSH_AGENT_SIGN_RESPONSE) +
+               SshWireFormat.encodeString(encodedSig)
+    }
+
+    /**
+     * Build SSH_AGENT_SIGN_RESPONSE for ECDSA P-256.
+     * signature: raw DER bytes from Android's NONEwithECDSA.
+     */
+    fun signResponseEcdsaP256(signature: ByteArray): ByteArray {
+        val encodedSig = SshWireFormat.encodeEcdsaP256SignatureFromDer(signature)
+        return byteArrayOf(AgentMessageType.SSH_AGENT_SIGN_RESPONSE) +
+               SshWireFormat.encodeString(encodedSig)
     }
 
     /** Build POCKET_AUTH_SUCCESS response. */

@@ -237,10 +237,20 @@ private fun KeyRow(key: KeyMetadata, keyManager: KeyManager, onDelete: () -> Uni
     var fingerprint by remember { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxWidth()) {
+        val keyType = remember(key.alias) {
+            try {
+                val enc = keyManager.getPublicKey(key.alias).encoded
+                when {
+                    com.example.pocketsshagent.agent.SshWireFormat.isEd25519PublicKey(enc) -> "Ed25519"
+                    com.example.pocketsshagent.agent.SshWireFormat.isP256PublicKey(enc) -> "ECDSA P-256"
+                    else -> keyManager.getKeyAlgorithm(key.alias) ?: "Unknown"
+                }
+            } catch (_: Exception) { "Unknown" }
+        }
         Text(text = key.label, style = MaterialTheme.typography.titleMedium)
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = if (key.hardwareBacked) "Hardware-backed" else "Software-backed",
+            text = "$keyType · ${if (key.hardwareBacked) "Hardware-backed" else "Software-backed"}",
             style = MaterialTheme.typography.bodySmall
         )
         Spacer(modifier = Modifier.height(8.dp))
