@@ -26,7 +26,7 @@ class KeyManager(private val context: Context) {
             alias,
             KeyProperties.PURPOSE_SIGN
         )
-            .setDigests(KeyProperties.DIGEST_NONE)
+            .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA256)
             .setUserAuthenticationRequired(true)
             .setUserAuthenticationParameters(
                 0,

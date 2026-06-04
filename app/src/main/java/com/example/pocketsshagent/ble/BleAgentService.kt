@@ -58,7 +58,7 @@ class BleAgentService : Service() {
 
     // Binder for local binding (e.g., to set AgentCallback from Activity)
     private val binder = LocalBinder()
-    private var agentCallback: AgentCallback? = null
+    @Volatile private var agentCallback: AgentCallback? = null
 
     inner class LocalBinder : Binder() {
         fun getService(): BleAgentService = this@BleAgentService
@@ -72,7 +72,6 @@ class BleAgentService : Service() {
      */
     fun setAgentCallback(callback: AgentCallback) {
         this.agentCallback = callback
-        agentHandler = SshAgentHandler(KeyManager(this), callback, TrustStore(this))
     }
 
     override fun onCreate() {

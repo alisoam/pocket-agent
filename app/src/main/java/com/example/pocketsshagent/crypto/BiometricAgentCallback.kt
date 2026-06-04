@@ -56,8 +56,8 @@ class BiometricAgentCallback(
                 }
 
             // Determine signing algorithm from the public key's X.509 OID.
-            // NONEwithECDSA for P-256: OpenSSH sends a pre-hashed SHA-256 digest
-            // via PKCS#11 CKM_ECDSA, so we sign raw without re-hashing.
+            // NONEwithECDSA for P-256: the proxy pre-hashes data to SHA-256 before
+            // sending, so we always sign raw (no re-hashing on Android).
             val pubEncoded = keyStore.getCertificate(alias)?.publicKey?.encoded
             val sigAlgo = when {
                 pubEncoded != null && SshWireFormat.isP256PublicKey(pubEncoded) -> "NONEwithECDSA"
