@@ -16,9 +16,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.Button
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -74,7 +75,7 @@ fun PairingScreen(onBack: () -> Unit) {
                     }
                 )
             }
-            Button(
+            TextButton(
                 onClick = { scanning = false },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -86,57 +87,58 @@ fun PairingScreen(onBack: () -> Unit) {
         return
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "Paired Devices",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold
-            )
-            TextButton(onClick = onBack) {
-                Text("Back")
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        floatingActionButton = {
+            FloatingActionButton(
+                onClick = {
+                    if (hasCameraPermission) {
+                        scanning = true
+                    } else {
+                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                    }
+                }
+            ) {
+                Text("+")
             }
         }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Button(
-            onClick = {
-                if (hasCameraPermission) {
-                    scanning = true
-                } else {
-                    cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-                }
-            },
-            modifier = Modifier.fillMaxWidth()
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(16.dp)
         ) {
-            Text("Scan QR to Pair Device")
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        if (devices.isEmpty()) {
-            Text("No paired devices. Scan a QR code from the desktop proxy to pair.")
-        } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                items(devices) { device ->
-                    DeviceRow(
-                        device = device,
-                        onRemove = {
-                            trustStore.removeDevice(device.publicKey)
-                            devices = trustStore.getAllDevices()
-                            Toast.makeText(context, "Removed: ${device.label}", Toast.LENGTH_SHORT).show()
-                        }
-                    )
-                    HorizontalDivider()
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Paired Devices",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                TextButton(onClick = onBack) {
+                    Text("Back")
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            if (devices.isEmpty()) {
+                Text("No paired devices. Scan a QR code from the desktop proxy to pair.")
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(devices) { device ->
+                        DeviceRow(
+                            device = device,
+                            onRemove = {
+                                trustStore.removeDevice(device.publicKey)
+                                devices = trustStore.getAllDevices()
+                                Toast.makeText(context, "Removed: ${device.label}", Toast.LENGTH_SHORT).show()
+                            }
+                        )
+                        HorizontalDivider()
+                    }
                 }
             }
         }
