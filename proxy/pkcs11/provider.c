@@ -502,8 +502,8 @@ CK_RV C_GetTokenInfo(CK_SLOT_ID slotID, CK_TOKEN_INFO_PTR pInfo) {
     pad_string(pInfo->model, "v1.0", 16);
     pad_string(pInfo->serialNumber, "0000000001", 16);
     
-    pInfo->flags = CKF_TOKEN_INITIALIZED | CKF_USER_PIN_INITIALIZED | 
-                   CKF_LOGIN_REQUIRED | CKF_PROTECTED_AUTHENTICATION_PATH;
+    pInfo->flags = CKF_TOKEN_INITIALIZED | CKF_USER_PIN_INITIALIZED |
+                   CKF_PROTECTED_AUTHENTICATION_PATH;
     
     pInfo->ulMaxSessionCount = 0; /* Unlimited */
     pInfo->ulMaxRwSessionCount = 0; /* Unlimited */

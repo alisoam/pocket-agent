@@ -51,26 +51,31 @@ var globalBackend *Backend
 // Initialize sets up the PKCS#11 backend
 func Initialize(privateKey ed25519.PrivateKey) error {
 	log.Println("[PKCS11] Initializing backend...")
-	
+
 	if globalBackend != nil {
-		log.Println("[PKCS11] Already initialized")
-		return fmt.Errorf("already initialized")
+		log.Println("[PKCS11] Already initialized, reusing existing backend")
+		return nil
 	}
 
-	// Create connection manager but don't start it yet
-	// (lazy start on first actual use to avoid delays during SSH probing)
 	connMgr := ble.NewConnectionManager(privateKey)
 
 	globalBackend = &Backend{
 		connMgr:     connMgr,
 		privateKey:  privateKey,
-		connStarted: false,
+		connStarted: true,
 		sessions:    make(map[uint64]*Session),
 		objects:     make(map[uint64]*Object),
 		nextHandle:  1,
 	}
 
-	log.Println("[PKCS11] Backend initialized successfully")
+	// Start BLE connection manager immediately so it has time to connect
+	// before C_FindObjectsInit is called.
+	if err := connMgr.Start(); err != nil {
+		globalBackend = nil
+		return fmt.Errorf("failed to start BLE connection manager: %w", err)
+	}
+
+	log.Println("[PKCS11] Backend initialized, BLE connection manager started")
 	return nil
 }
 
@@ -117,8 +122,8 @@ func (b *Backend) ensureConnected() error {
 	b.mu.Unlock()
 
 	if !b.connMgr.IsConnected() {
-		log.Println("[PKCS11] Waiting for BLE connection to Android...")
-		if err := b.connMgr.WaitUntilConnected(15 * time.Second); err != nil {
+		log.Println("[PKCS11] Waiting for BLE connection to Android (open the app if not running)...")
+		if err := b.connMgr.WaitUntilConnected(60 * time.Second); err != nil {
 			return fmt.Errorf("BLE not ready: %w", err)
 		}
 	}
@@ -400,19 +405,13 @@ func (b *Backend) Sign(sessionHandle uint64, objectHandle uint64, data []byte) (
 	log.Printf("[PKCS11] Sign: session=%d object=%d data_len=%d", sessionHandle, objectHandle, len(data))
 	
 	b.mu.RLock()
-	session, sessionExists := b.sessions[sessionHandle]
+	_, sessionExists := b.sessions[sessionHandle]
 	obj, objExists := b.objects[objectHandle]
 	b.mu.RUnlock()
 
 	if !sessionExists {
 		log.Printf("[PKCS11] Invalid session handle: %d", sessionHandle)
 		return nil, fmt.Errorf("invalid session handle")
-	}
-
-	// Check if user is logged in
-	if session.State != CKS_RO_USER_FUNCTIONS && session.State != CKS_RW_USER_FUNCTIONS {
-		log.Printf("[PKCS11] User not logged in: state=%d", session.State)
-		return nil, fmt.Errorf("user not logged in")
 	}
 
 	if !objExists || obj.Class != CKO_PRIVATE_KEY {

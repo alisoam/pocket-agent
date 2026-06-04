@@ -38,6 +38,7 @@ import (
 	"github.com/example/pocket-agent-proxy/internal/pkcs11"
 )
 
+
 // loadPrivateKey loads the device's private key for BLE authentication
 func loadPrivateKey() (ed25519.PrivateKey, error) {
 	home, err := os.UserHomeDir()

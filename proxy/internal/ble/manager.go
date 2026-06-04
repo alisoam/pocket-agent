@@ -242,17 +242,14 @@ func (cm *ConnectionManager) connectionLoop() {
 		}
 
 		// Exponential backoff before retry
+		cm.incrementAttemptCounter()
 		delay := cm.calculateBackoff()
-		if delay > 0 {
-			cm.incrementAttemptCounter()
-			attempt := cm.getAttemptCounter()
-			log.Printf("Retry %d/∞ (waiting %v)", attempt, delay.Round(100*time.Millisecond))
-
-			select {
-			case <-time.After(delay):
-			case <-cm.stopCh:
-				return
-			}
+		attempt := cm.getAttemptCounter()
+		log.Printf("Retry %d/∞ (waiting %v)", attempt, delay.Round(100*time.Millisecond))
+		select {
+		case <-time.After(delay):
+		case <-cm.stopCh:
+			return
 		}
 	}
 }
