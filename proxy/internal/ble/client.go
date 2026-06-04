@@ -1,6 +1,7 @@
 package ble
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
@@ -40,12 +41,14 @@ type Client struct {
 	txChar  bluetooth.DeviceCharacteristic
 	mtu     int
 
-	responseCh chan []byte
-	rxBuf      []byte
-	rxExpected int
-	rxMu       sync.Mutex
+	responseCh    chan []byte
+	rxBuf         []byte
+	rxExpected    int
+	pendingCorrID [4]byte // protected by rxMu
+	rxMu          sync.Mutex
 
 	connected bool
+	scanning  bool // true while adapter.Scan is in progress; protected by mu
 	mu        sync.Mutex
 }
 
@@ -74,6 +77,10 @@ func (c *Client) Connect() error {
 	var foundDevice bluetooth.ScanResult
 	found := make(chan struct{})
 
+	c.mu.Lock()
+	c.scanning = true
+	c.mu.Unlock()
+
 	err := c.adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
 		if result.HasServiceUUID(ServiceUUID) {
 			foundDevice = result
@@ -86,6 +93,9 @@ func (c *Client) Connect() error {
 		select {
 		case <-found:
 		default:
+			c.mu.Lock()
+			c.scanning = false
+			c.mu.Unlock()
 			return fmt.Errorf("scan failed: %w", err)
 		}
 	}
@@ -94,8 +104,15 @@ func (c *Client) Connect() error {
 	case <-found:
 	case <-time.After(10 * time.Second):
 		c.adapter.StopScan()
+		c.mu.Lock()
+		c.scanning = false
+		c.mu.Unlock()
 		return fmt.Errorf("timeout: no SSH agent device found after 10s scan")
 	}
+
+	c.mu.Lock()
+	c.scanning = false
+	c.mu.Unlock()
 
 	log.Printf("Found device: %s (%s)", foundDevice.LocalName(), foundDevice.Address.String())
 
@@ -220,10 +237,23 @@ func (c *Client) SendMessage(msg []byte) ([]byte, error) {
 	default:
 	}
 
-	// Frame the message (4-byte length prefix + payload)
-	framed := make([]byte, 4+len(msg))
-	binary.BigEndian.PutUint32(framed[0:4], uint32(len(msg)))
-	copy(framed[4:], msg)
+	// Generate a correlation ID so this client can ignore responses destined
+	// for other clients sharing the same underlying BLE connection/notifications.
+	var corrID [4]byte
+	if _, err := rand.Read(corrID[:]); err != nil {
+		return nil, fmt.Errorf("failed to generate correlation ID: %w", err)
+	}
+	c.rxMu.Lock()
+	c.pendingCorrID = corrID
+	c.rxMu.Unlock()
+
+	// Frame: [4B ble_len][4B corr_id][msg]
+	payload := make([]byte, 4+len(msg))
+	copy(payload[:4], corrID[:])
+	copy(payload[4:], msg)
+	framed := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(framed[0:4], uint32(len(payload)))
+	copy(framed[4:], payload)
 
 	// Send in MTU-sized chunks
 	log.Printf("BLE: sending message (%d bytes, type=%d) in %d-byte chunks", len(msg), msg[0], c.mtu)
@@ -270,9 +300,12 @@ func (c *Client) Disconnect() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	
-	// Stop any ongoing scan
-	if c.adapter != nil {
+	// Only stop the scan if this client started it. Calling StopScan on the
+	// shared adapter while another client is scanning would kill that client's
+	// reconnect attempt.
+	if c.scanning && c.adapter != nil {
 		c.adapter.StopScan()
+		c.scanning = false
 	}
 	
 	// Disconnect device if connected
@@ -304,13 +337,30 @@ func (c *Client) handleNotification(buf []byte) {
 		return
 	}
 
-	// Complete response received
-	message := make([]byte, c.rxExpected)
-	copy(message, c.rxBuf[4:totalNeeded])
+	// Complete response received.
+	// Frame layout: [4B ble_len][4B corr_id][4B ssh_len][ssh_payload]
+	// After stripping ble_len: fullPayload = [4B corr_id][4B ssh_len][ssh_payload]
+	fullPayload := c.rxBuf[4:totalNeeded]
 
-	// Reset
+	// Reset before any early return so the next response can be received.
 	c.rxBuf = nil
 	c.rxExpected = 0
+
+	if len(fullPayload) < 8 {
+		log.Printf("BLE: response too short (%d bytes), dropping", len(fullPayload))
+		return
+	}
+
+	// Drop responses whose correlation ID doesn't match — they belong to
+	// another process sharing the same BLE connection/notifications.
+	if !bytes.Equal(fullPayload[:4], c.pendingCorrID[:]) {
+		log.Printf("BLE: correlation ID mismatch — dropping response (belongs to another client)")
+		return
+	}
+
+	// Strip corr_id (4B) and inner ssh_len (4B) to get the raw SSH response.
+	message := make([]byte, len(fullPayload)-8)
+	copy(message, fullPayload[8:])
 
 	log.Printf("BLE: received response (%d bytes, type=%d)", len(message), message[0])
 

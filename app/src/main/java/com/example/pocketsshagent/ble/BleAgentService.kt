@@ -225,14 +225,29 @@ class BleAgentService : Service() {
     private fun handleIncomingChunk(device: BluetoothDevice, chunk: ByteArray) {
         val addr = device.address
         val assembler = deviceAssemblers.getOrPut(addr) { BleFrameAssembler() }
-        val message = assembler.feed(chunk) ?: return
+        // frame = [4B corr_id][ssh_msg]
+        val frame = assembler.feed(chunk) ?: return
 
-        // Complete message received — process it
-        Log.d(TAG, "Complete agent message received from $addr (${message.size} bytes)")
+        Log.d(TAG, "Complete agent message received from $addr (${frame.size} bytes)")
+
+        if (frame.size < 4) {
+            Log.w(TAG, "Frame too short for correlation ID from $addr")
+            return
+        }
+
+        // Extract correlation ID so we can echo it back in the response, letting
+        // multiple independent clients sharing the same BLE connection filter
+        // responses that belong to them.
+        val correlationId = frame.copyOfRange(0, 4)
+        val message = frame.copyOfRange(4, frame.size)
 
         agentHandler.handleMessage(message) { response ->
-            Log.d(TAG, "Sending response to $addr (${response.size} bytes)")
-            sendResponse(device, response)
+            // response = SshWireFormat.frameMessage(result) = [4B ssh_len][result]
+            // Send: [4B ble_len][4B corr_id][4B ssh_len][result]
+            val blePayload = correlationId + response
+            val bleFrame = SshWireFormat.encodeUint32(blePayload.size) + blePayload
+            Log.d(TAG, "Sending response to $addr (${bleFrame.size} bytes)")
+            sendResponse(device, bleFrame)
         }
     }
 
