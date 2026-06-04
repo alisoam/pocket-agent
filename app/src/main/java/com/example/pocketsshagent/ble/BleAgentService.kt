@@ -3,6 +3,7 @@ package com.example.pocketsshagent.ble
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -18,6 +19,7 @@ import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Intent
 import android.content.pm.PackageManager
+import com.example.pocketsshagent.MainActivity
 import android.os.Binder
 import android.os.IBinder
 import android.os.ParcelUuid
@@ -39,9 +41,18 @@ class BleAgentService : Service() {
     companion object {
         private const val TAG = "BleAgentService"
         private const val NOTIFICATION_CHANNEL_ID = "ssh_agent_channel"
+        private const val SIGN_CHANNEL_ID = "ssh_sign_requests"
         private const val NOTIFICATION_ID = 1
+        private const val SIGN_NOTIFICATION_ID = 2
         private const val DEFAULT_MTU = 20
+        const val ACTION_SIGN_REQUEST = "com.example.pocketsshagent.ACTION_SIGN_REQUEST"
     }
+
+    data class PendingSignRequest(
+        val alias: String,
+        val data: ByteArray,
+        val onResult: (ByteArray?) -> Unit
+    )
 
     private lateinit var bluetoothManager: BluetoothManager
     private var gattServer: BluetoothGattServer? = null
@@ -59,6 +70,7 @@ class BleAgentService : Service() {
     // Binder for local binding (e.g., to set AgentCallback from Activity)
     private val binder = LocalBinder()
     @Volatile private var agentCallback: AgentCallback? = null
+    @Volatile private var pendingSignRequest: PendingSignRequest? = null
 
     inner class LocalBinder : Binder() {
         fun getService(): BleAgentService = this@BleAgentService
@@ -66,12 +78,41 @@ class BleAgentService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = binder
 
-    /**
-     * Set the callback used for biometric signing prompts.
-     * Must be called from the Activity after binding.
-     */
     fun setAgentCallback(callback: AgentCallback) {
         this.agentCallback = callback
+    }
+
+    fun setPendingSignRequest(request: PendingSignRequest) {
+        pendingSignRequest = request
+    }
+
+    fun consumePendingSignRequest(): PendingSignRequest? {
+        val req = pendingSignRequest
+        pendingSignRequest = null
+        if (req != null) {
+            getSystemService(NotificationManager::class.java).cancel(SIGN_NOTIFICATION_ID)
+        }
+        return req
+    }
+
+    fun postSignNotification(alias: String) {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = ACTION_SIGN_REQUEST
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val pi = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = Notification.Builder(this, SIGN_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setContentTitle("SSH Sign Request")
+            .setContentText("Tap to approve signing with: $alias")
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .setPriority(Notification.PRIORITY_HIGH)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(SIGN_NOTIFICATION_ID, notification)
     }
 
     override fun onCreate() {
@@ -315,15 +356,21 @@ class BleAgentService : Service() {
     // ─── Notification ───────────────────────────────────────────────────────────
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            NOTIFICATION_CHANNEL_ID,
-            "SSH Agent",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "SSH Agent BLE service is active"
-        }
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(channel)
+        nm.createNotificationChannel(
+            NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "SSH Agent",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply { description = "SSH Agent BLE service is active" }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(
+                SIGN_CHANNEL_ID,
+                "SSH Sign Requests",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply { description = "Tap to approve SSH signing requests" }
+        )
     }
 
     private fun buildNotification(): Notification {

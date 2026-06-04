@@ -57,16 +57,22 @@ import com.example.pocketsshagent.ui.theme.PocketSSHAgentTheme
 class MainActivity : FragmentActivity() {
 
     private var bleService: BleAgentService? = null
+    private var biometricCallback: BiometricAgentCallback? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as BleAgentService.LocalBinder
-            bleService = binder.getService()
-            bleService?.setAgentCallback(BiometricAgentCallback(this@MainActivity))
+            val svc = binder.getService()
+            bleService = svc
+            val cb = BiometricAgentCallback(this@MainActivity, svc)
+            biometricCallback = cb
+            svc.setAgentCallback(cb)
+            cb.resumePendingSign()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             bleService = null
+            biometricCallback = null
         }
     }
 
@@ -107,6 +113,11 @@ class MainActivity : FragmentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        biometricCallback?.resumePendingSign()
     }
 
     override fun onDestroy() {

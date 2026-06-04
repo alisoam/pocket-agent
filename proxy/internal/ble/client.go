@@ -274,11 +274,15 @@ func (c *Client) SendMessage(msg []byte) ([]byte, error) {
 		}
 	}
 
-	// Wait for response
+	// Wait for response — sign requests need extra time for notification tap + biometric
+	timeout := 10 * time.Second
+	if len(msg) > 0 && msg[0] == 13 { // SSH_AGENTC_SIGN_REQUEST
+		timeout = 60 * time.Second
+	}
 	select {
 	case response := <-c.responseCh:
 		return response, nil
-	case <-time.After(10 * time.Second):
+	case <-time.After(timeout):
 		return nil, fmt.Errorf("timeout waiting for response")
 	}
 }

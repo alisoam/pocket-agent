@@ -1,21 +1,20 @@
 package com.example.pocketsshagent.crypto
 
-import android.content.Intent
 import android.util.Log
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
-import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleOwner
 import com.example.pocketsshagent.agent.AgentCallback
 import com.example.pocketsshagent.agent.SshWireFormat
+import com.example.pocketsshagent.ble.BleAgentService
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.Signature
 
 class BiometricAgentCallback(
-    private val activity: FragmentActivity
+    private val activity: FragmentActivity,
+    private val service: BleAgentService
 ) : AgentCallback {
 
     companion object {
@@ -28,19 +27,17 @@ class BiometricAgentCallback(
             if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                 showBiometricPrompt(alias, data, onResult)
             } else {
-                Log.d(TAG, "App not in foreground, bringing to front for biometric prompt")
-                val intent = Intent(activity, activity.javaClass).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-                }
-                activity.startActivity(intent)
-                activity.lifecycle.addObserver(object : DefaultLifecycleObserver {
-                    override fun onResume(owner: LifecycleOwner) {
-                        owner.lifecycle.removeObserver(this)
-                        showBiometricPrompt(alias, data, onResult)
-                    }
-                })
+                Log.d(TAG, "App not in foreground, posting sign notification for: $alias")
+                service.setPendingSignRequest(BleAgentService.PendingSignRequest(alias, data, onResult))
+                service.postSignNotification(alias)
             }
         }
+    }
+
+    fun resumePendingSign() {
+        val req = service.consumePendingSignRequest() ?: return
+        Log.d(TAG, "Resuming pending sign request for: ${req.alias}")
+        showBiometricPrompt(req.alias, req.data, req.onResult)
     }
 
     private fun showBiometricPrompt(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit) {
