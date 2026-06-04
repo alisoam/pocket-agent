@@ -50,6 +50,8 @@ class BleAgentService : Service() {
 
     data class PendingSignRequest(
         val alias: String,
+        val keyLabel: String,
+        val deviceName: String?,
         val data: ByteArray,
         val onResult: (ByteArray?) -> Unit
     )
@@ -95,7 +97,7 @@ class BleAgentService : Service() {
         return req
     }
 
-    fun postSignNotification(alias: String) {
+    fun postSignNotification(keyLabel: String, deviceName: String?) {
         val intent = Intent(this, MainActivity::class.java).apply {
             action = ACTION_SIGN_REQUEST
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
@@ -104,10 +106,11 @@ class BleAgentService : Service() {
             this, 0, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val contentText = if (deviceName != null) "$deviceName wants to sign with: $keyLabel" else "Tap to approve signing with: $keyLabel"
         val notification = Notification.Builder(this, SIGN_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("SSH Sign Request")
-            .setContentText("Tap to approve signing with: $alias")
+            .setContentText(contentText)
             .setContentIntent(pi)
             .setAutoCancel(true)
             .setPriority(Notification.PRIORITY_HIGH)
@@ -120,11 +123,11 @@ class BleAgentService : Service() {
         bluetoothManager = getSystemService(BluetoothManager::class.java)
         val trustStore = TrustStore(this)
         agentHandler = SshAgentHandler(KeyManager(this), object : AgentCallback {
-            override fun requestBiometricSign(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit) {
+            override fun requestBiometricSign(alias: String, keyLabel: String, deviceName: String?, data: ByteArray, onResult: (ByteArray?) -> Unit) {
                 // Delegate to the activity-provided callback, or deny
                 val cb = agentCallback
                 if (cb != null) {
-                    cb.requestBiometricSign(alias, data, onResult)
+                    cb.requestBiometricSign(alias, keyLabel, deviceName, data, onResult)
                 } else {
                     Log.w(TAG, "No AgentCallback set, denying sign request")
                     onResult(null)

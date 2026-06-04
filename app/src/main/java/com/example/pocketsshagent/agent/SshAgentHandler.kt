@@ -9,7 +9,7 @@ import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
 
 interface AgentCallback {
-    fun requestBiometricSign(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit)
+    fun requestBiometricSign(alias: String, keyLabel: String, deviceName: String?, data: ByteArray, onResult: (ByteArray?) -> Unit)
 }
 
 class SshAgentHandler(
@@ -22,9 +22,11 @@ class SshAgentHandler(
     }
 
     private var authenticated = false
+    private var authenticatedDeviceKey: String? = null
 
     fun resetSession() {
         authenticated = false
+        authenticatedDeviceKey = null
     }
 
     fun handleMessage(message: ByteArray, onResponse: (ByteArray) -> Unit) {
@@ -93,6 +95,7 @@ class SshAgentHandler(
         }
 
         authenticated = true
+        authenticatedDeviceKey = publicKeyBase64
         trustStore?.updateLastSeen(publicKeyBase64)
         Log.i(TAG, "Session authenticated for device: $publicKeyBase64")
         onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authSuccess()))
@@ -144,7 +147,10 @@ class SshAgentHandler(
             return
         }
 
-        callback.requestBiometricSign(alias, signRequest.data) { signature ->
+        val keyLabel = keyManager.listKeys().find { it.alias == alias }?.label ?: alias
+        val deviceName = authenticatedDeviceKey?.let { trustStore?.getDevice(it)?.label }
+
+        callback.requestBiometricSign(alias, keyLabel, deviceName, signRequest.data) { signature ->
             if (signature != null) {
                 keyManager.updateLastUsed(alias)
                 val response = if (isP256) {

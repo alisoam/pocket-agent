@@ -22,14 +22,14 @@ class BiometricAgentCallback(
         private const val ANDROID_KEY_STORE = "AndroidKeyStore"
     }
 
-    override fun requestBiometricSign(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit) {
+    override fun requestBiometricSign(alias: String, keyLabel: String, deviceName: String?, data: ByteArray, onResult: (ByteArray?) -> Unit) {
         activity.runOnUiThread {
             if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-                showBiometricPrompt(alias, data, onResult)
+                showBiometricPrompt(alias, keyLabel, deviceName, data, onResult)
             } else {
                 Log.d(TAG, "App not in foreground, posting sign notification for: $alias")
-                service.setPendingSignRequest(BleAgentService.PendingSignRequest(alias, data, onResult))
-                service.postSignNotification(alias)
+                service.setPendingSignRequest(BleAgentService.PendingSignRequest(alias, keyLabel, deviceName, data, onResult))
+                service.postSignNotification(keyLabel, deviceName)
             }
         }
     }
@@ -37,10 +37,10 @@ class BiometricAgentCallback(
     fun resumePendingSign() {
         val req = service.consumePendingSignRequest() ?: return
         Log.d(TAG, "Resuming pending sign request for: ${req.alias}")
-        showBiometricPrompt(req.alias, req.data, req.onResult)
+        showBiometricPrompt(req.alias, req.keyLabel, req.deviceName, req.data, req.onResult)
     }
 
-    private fun showBiometricPrompt(alias: String, data: ByteArray, onResult: (ByteArray?) -> Unit) {
+    private fun showBiometricPrompt(alias: String, keyLabel: String, deviceName: String?, data: ByteArray, onResult: (ByteArray?) -> Unit) {
         try {
             val keyStore = KeyStore.getInstance(ANDROID_KEY_STORE)
             keyStore.load(null)
@@ -99,10 +99,11 @@ class BiometricAgentCallback(
                 }
             )
 
+            val description = if (deviceName != null) "Requested by: $deviceName" else "An SSH client is requesting a signature."
             val promptInfo = BiometricPrompt.PromptInfo.Builder()
                 .setTitle("SSH Signing Request")
-                .setSubtitle("Approve to sign with key: $alias")
-                .setDescription("An SSH client is requesting a signature.")
+                .setSubtitle("Sign with key: $keyLabel")
+                .setDescription(description)
                 .setAllowedAuthenticators(
                     androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG or
                             androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
