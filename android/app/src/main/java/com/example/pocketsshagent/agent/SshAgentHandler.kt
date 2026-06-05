@@ -118,7 +118,9 @@ class SshAgentHandler(
             val publicKey = keyFactory.generatePublic(keySpec)
             val sig = Signature.getInstance("Ed25519")
             sig.initVerify(publicKey)
-            sig.update(authRequest.nonce)
+            // Signature covers nonce || x25519EphemeralKey, binding the ephemeral key
+            // to the Ed25519 identity to prevent MITM substitution.
+            sig.update(authRequest.nonce + authRequest.x25519EphemeralKey)
             sig.verify(authRequest.signature)
         } catch (e: Exception) {
             Log.e(TAG, "Auth signature verification failed", e)

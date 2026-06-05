@@ -185,6 +185,9 @@ func (c *Client) Connect() error {
 //
 //	byte(100) | string(x509_pubkey) | string(nonce) | string(ed25519_sig) | string(x25519_ephemeral_pub)
 //
+// ed25519_sig covers nonce || x25519_ephemeral_pub (not the nonce alone), binding
+// the ephemeral key to the Ed25519 identity and preventing MITM key substitution.
+//
 // Protocol (type 101 success response):
 //
 //	byte(101) | string(x25519_ephemeral_pub_phone)
@@ -198,9 +201,6 @@ func (c *Client) Authenticate(privateKey ed25519.PrivateKey) error {
 		return fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	// Sign the nonce
-	signature := ed25519.Sign(privateKey, nonce)
-
 	// Encode public key as X.509
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 	x509PubKey, err := x509.MarshalPKIXPublicKey(publicKey)
@@ -208,12 +208,17 @@ func (c *Client) Authenticate(privateKey ed25519.PrivateKey) error {
 		return fmt.Errorf("failed to marshal public key: %w", err)
 	}
 
-	// Generate ephemeral X25519 keypair for ECDH
+	// Generate ephemeral X25519 keypair for ECDH (must happen before signing)
 	ephemPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("failed to generate X25519 key: %w", err)
 	}
 	ephemPub := ephemPriv.PublicKey().Bytes() // 32 bytes
+
+	// Sign nonce || ephemPub so the X25519 key is bound to the Ed25519 identity.
+	// Signing only the nonce would allow a MITM to swap the ephemeral key.
+	signedData := append(nonce, ephemPub...)
+	signature := ed25519.Sign(privateKey, signedData)
 
 	// Build auth message: byte(100) | string(pubkey) | string(nonce) | string(sig) | string(x25519_pub)
 	msg := []byte{100} // POCKET_AUTH_REQUEST
