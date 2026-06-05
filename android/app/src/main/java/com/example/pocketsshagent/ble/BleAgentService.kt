@@ -21,7 +21,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import com.example.pocketsshagent.MainActivity
 import android.os.Binder
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import com.example.pocketsshagent.agent.AgentCallback
@@ -46,6 +48,8 @@ class BleAgentService : Service() {
         private const val SIGN_NOTIFICATION_ID = 2
         private const val DEFAULT_MTU = 20
         const val ACTION_SIGN_REQUEST = "com.example.pocketsshagent.ACTION_SIGN_REQUEST"
+        const val ACTION_CANCEL_SIGN = "com.example.pocketsshagent.ACTION_CANCEL_SIGN"
+        private const val SIGN_REQUEST_TIMEOUT_MS = 30_000L
     }
 
     data class PendingSignRequest(
@@ -74,6 +78,9 @@ class BleAgentService : Service() {
     @Volatile private var agentCallback: AgentCallback? = null
     @Volatile private var pendingSignRequest: PendingSignRequest? = null
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val signTimeoutRunnable = Runnable { cancelPendingSignRequest() }
+
     inner class LocalBinder : Binder() {
         fun getService(): BleAgentService = this@BleAgentService
     }
@@ -86,9 +93,12 @@ class BleAgentService : Service() {
 
     fun setPendingSignRequest(request: PendingSignRequest) {
         pendingSignRequest = request
+        mainHandler.removeCallbacks(signTimeoutRunnable)
+        mainHandler.postDelayed(signTimeoutRunnable, SIGN_REQUEST_TIMEOUT_MS)
     }
 
     fun consumePendingSignRequest(): PendingSignRequest? {
+        mainHandler.removeCallbacks(signTimeoutRunnable)
         val req = pendingSignRequest
         pendingSignRequest = null
         if (req != null) {
@@ -97,13 +107,29 @@ class BleAgentService : Service() {
         return req
     }
 
+    private fun cancelPendingSignRequest() {
+        mainHandler.removeCallbacks(signTimeoutRunnable)
+        val req = pendingSignRequest
+        pendingSignRequest = null
+        getSystemService(NotificationManager::class.java).cancel(SIGN_NOTIFICATION_ID)
+        if (req != null) {
+            Log.d(TAG, "Pending sign request cancelled")
+            req.onResult(null)
+        }
+    }
+
     fun postSignNotification(keyLabel: String, deviceName: String?) {
-        val intent = Intent(this, MainActivity::class.java).apply {
+        val tapIntent = Intent(this, MainActivity::class.java).apply {
             action = ACTION_SIGN_REQUEST
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
         }
-        val pi = PendingIntent.getActivity(
-            this, 0, intent,
+        val tapPi = PendingIntent.getActivity(
+            this, 0, tapIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val cancelPi = PendingIntent.getService(
+            this, 0,
+            Intent(this, BleAgentService::class.java).apply { action = ACTION_CANCEL_SIGN },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val contentText = if (deviceName != null) "$deviceName wants to sign with: $keyLabel" else "Tap to approve signing with: $keyLabel"
@@ -111,7 +137,8 @@ class BleAgentService : Service() {
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("SSH Sign Request")
             .setContentText(contentText)
-            .setContentIntent(pi)
+            .setContentIntent(tapPi)
+            .setDeleteIntent(cancelPi)
             .setAutoCancel(true)
             .setPriority(Notification.PRIORITY_HIGH)
             .build()
@@ -140,12 +167,18 @@ class BleAgentService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_CANCEL_SIGN) {
+            cancelPendingSignRequest()
+            return START_NOT_STICKY
+        }
         startGattServer()
         startAdvertising()
         return START_STICKY
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(signTimeoutRunnable)
+        cancelPendingSignRequest()
         stopAdvertising()
         gattServer?.close()
         gattServer = null

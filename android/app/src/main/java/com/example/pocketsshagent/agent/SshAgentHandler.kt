@@ -7,6 +7,7 @@ import com.example.pocketsshagent.pairing.TrustStore
 import java.security.KeyFactory
 import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
+import java.util.concurrent.atomic.AtomicBoolean
 
 interface AgentCallback {
     fun requestBiometricSign(alias: String, keyLabel: String, deviceName: String?, data: ByteArray, onResult: (ByteArray?) -> Unit)
@@ -23,10 +24,12 @@ class SshAgentHandler(
 
     private var authenticated = false
     private var authenticatedDeviceKey: String? = null
+    private val signingInProgress = AtomicBoolean(false)
 
     fun resetSession() {
         authenticated = false
         authenticatedDeviceKey = null
+        signingInProgress.set(false)
     }
 
     fun handleMessage(message: ByteArray, onResponse: (ByteArray) -> Unit) {
@@ -135,14 +138,22 @@ class SshAgentHandler(
     }
 
     private fun handleSignRequest(message: ByteArray, onResponse: (ByteArray) -> Unit) {
+        if (!signingInProgress.compareAndSet(false, true)) {
+            Log.w(TAG, "Sign request rejected: signing already in progress")
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            return
+        }
+
         val signRequest = try {
             AgentMessageParser.parseSignRequest(message)
         } catch (_: Exception) {
+            signingInProgress.set(false)
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
         }
 
         val (alias, isP256) = findKeyAlias(signRequest.keyBlob) ?: run {
+            signingInProgress.set(false)
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
         }
@@ -151,6 +162,7 @@ class SshAgentHandler(
         val deviceName = authenticatedDeviceKey?.let { trustStore?.getDevice(it)?.label }
 
         callback.requestBiometricSign(alias, keyLabel, deviceName, signRequest.data) { signature ->
+            signingInProgress.set(false)
             if (signature != null) {
                 keyManager.updateLastUsed(alias)
                 val response = if (isP256) {
