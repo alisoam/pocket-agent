@@ -123,6 +123,24 @@ func GoCloseSession(hSession C.CK_SESSION_HANDLE) C.CK_RV {
 	return C.CKR_OK
 }
 
+//export GoCloseAllSessions
+func GoCloseAllSessions(slotID C.CK_SLOT_ID) C.CK_RV {
+	log.Printf("[CGO] C_CloseAllSessions called: slotID=%d", slotID)
+
+	backend := pkcs11.GetBackend()
+	if backend == nil {
+		return C.CK_RV(pkcs11.CKR_CRYPTOKI_NOT_INITIALIZED)
+	}
+
+	if err := backend.CloseAllSessions(uint64(slotID)); err != nil {
+		log.Printf("[CGO] CloseAllSessions failed: %v", err)
+		return C.CK_RV(pkcs11.CKR_FUNCTION_FAILED)
+	}
+
+	log.Println("[CGO] C_CloseAllSessions succeeded")
+	return C.CKR_OK
+}
+
 //export GoLogin
 func GoLogin(hSession C.CK_SESSION_HANDLE, userType C.CK_USER_TYPE) C.CK_RV {
 	log.Printf("[CGO] C_Login called: session=%d userType=%d", hSession, userType)

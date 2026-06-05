@@ -208,6 +208,22 @@ func (b *Backend) CloseSession(handle uint64) error {
 	return nil
 }
 
+// CloseAllSessions closes all sessions belonging to the given slot
+func (b *Backend) CloseAllSessions(slotID uint64) error {
+	log.Printf("[PKCS11] CloseAllSessions: slotID=%d", slotID)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for handle, session := range b.sessions {
+		if session.SlotID == slotID {
+			delete(b.sessions, handle)
+			log.Printf("[PKCS11] Session closed via CloseAllSessions: handle=%d", handle)
+		}
+	}
+	return nil
+}
+
 // Login authenticates the user
 func (b *Backend) Login(sessionHandle uint64, userType uint64) error {
 	log.Printf("[PKCS11] Login: session=%d userType=%d", sessionHandle, userType)

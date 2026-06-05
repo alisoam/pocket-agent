@@ -258,6 +258,7 @@ extern CK_RV GoInitialize();
 extern CK_RV GoFinalize();
 extern CK_RV GoOpenSession(CK_SLOT_ID slotID, CK_FLAGS flags, CK_SESSION_HANDLE_PTR phSession);
 extern CK_RV GoCloseSession(CK_SESSION_HANDLE hSession);
+extern CK_RV GoCloseAllSessions(CK_SLOT_ID slotID);
 extern CK_RV GoLogin(CK_SESSION_HANDLE hSession, CK_USER_TYPE userType);
 extern CK_RV GoLogout(CK_SESSION_HANDLE hSession);
 extern CK_RV GoFindObjectsInit(CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount);
@@ -536,9 +537,7 @@ CK_RV C_CloseSession(CK_SESSION_HANDLE hSession) {
 
 /* C_CloseAllSessions */
 CK_RV C_CloseAllSessions(CK_SLOT_ID slotID) {
-    (void)slotID;
-    /* Not implemented - single session model */
-    return CKR_OK;
+    return GoCloseAllSessions(slotID);
 }
 
 /* C_GetSessionInfo */
