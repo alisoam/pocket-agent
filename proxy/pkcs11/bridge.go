@@ -297,13 +297,9 @@ func GoSignInit(hSession C.CK_SESSION_HANDLE, mechanism C.CK_ULONG, hKey C.CK_OB
 	return C.CKR_OK
 }
 
-// cachedSignature holds the result of the length-query C_Sign call so the
-// follow-up data-copy call doesn't trigger a second BLE round-trip to Android.
-var cachedSignature []byte
-
 //export GoSign
-func GoSign(hSession C.CK_SESSION_HANDLE, hKey C.CK_OBJECT_HANDLE, pData *C.CK_BYTE, ulDataLen C.CK_ULONG, pSignature *C.CK_BYTE, pulSignatureLen *C.CK_ULONG) C.CK_RV {
-	log.Printf("[CGO] C_Sign called: session=%d key=%d dataLen=%d sigBufNil=%v", hSession, hKey, ulDataLen, pSignature == nil)
+func GoSign(hSession C.CK_SESSION_HANDLE, _ C.CK_OBJECT_HANDLE, pData *C.CK_BYTE, ulDataLen C.CK_ULONG, pSignature *C.CK_BYTE, pulSignatureLen *C.CK_ULONG) C.CK_RV {
+	log.Printf("[CGO] C_Sign called: session=%d dataLen=%d sigBufNil=%v", hSession, ulDataLen, pSignature == nil)
 
 	backend := pkcs11.GetBackend()
 	if backend == nil {
@@ -313,28 +309,30 @@ func GoSign(hSession C.CK_SESSION_HANDLE, hKey C.CK_OBJECT_HANDLE, pData *C.CK_B
 	data := C.GoBytes(unsafe.Pointer(pData), C.int(ulDataLen))
 
 	if pSignature == nil {
-		// Length query: perform the BLE sign now and cache the result.
-		sig, err := backend.Sign(uint64(hSession), uint64(hKey), data)
+		// Length query: perform the BLE sign now and cache per-session.
+		// Pass objectHandle=0 so backend.Sign resolves the key from session.SignKeyHandle.
+		sig, err := backend.Sign(uint64(hSession), 0, data)
 		if err != nil {
 			log.Printf("[CGO] C_Sign (query) failed: %v", err)
-			cachedSignature = nil
+			_ = backend.CacheSignature(uint64(hSession), nil)
 			return C.CK_RV(pkcs11.CKR_FUNCTION_FAILED)
 		}
-		cachedSignature = sig
+		if err := backend.CacheSignature(uint64(hSession), sig); err != nil {
+			log.Printf("[CGO] C_Sign: failed to cache signature: %v", err)
+			return C.CK_RV(pkcs11.CKR_FUNCTION_FAILED)
+		}
 		*pulSignatureLen = C.CK_ULONG(len(sig))
 		log.Printf("[CGO] C_Sign query: sigLen=%d (cached)", len(sig))
 		return C.CKR_OK
 	}
 
-	// Data-copy call: use the cached signature if available, otherwise sign again.
-	var signature []byte
-	if cachedSignature != nil {
-		signature = cachedSignature
-		cachedSignature = nil
+	// Data-copy call: use the per-session cached signature if available, otherwise sign again.
+	signature := backend.TakeCachedSignature(uint64(hSession))
+	if signature != nil {
 		log.Printf("[CGO] C_Sign: using cached signature len=%d", len(signature))
 	} else {
 		var err error
-		signature, err = backend.Sign(uint64(hSession), uint64(hKey), data)
+		signature, err = backend.Sign(uint64(hSession), 0, data)
 		if err != nil {
 			log.Printf("[CGO] C_Sign failed: %v", err)
 			return C.CK_RV(pkcs11.CKR_FUNCTION_FAILED)

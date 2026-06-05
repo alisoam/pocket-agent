@@ -27,13 +27,14 @@ type Backend struct {
 
 // Session represents a PKCS#11 session
 type Session struct {
-	Handle        uint64
-	SlotID        uint64
-	Flags         uint64
-	State         uint64
-	SignKeyHandle uint64 // Active key for signing operation
-	FindActive    bool
-	FindKeys      []uint64 // Object handles from current find operation
+	Handle          uint64
+	SlotID          uint64
+	Flags           uint64
+	State           uint64
+	SignKeyHandle   uint64   // Active key for signing operation
+	FindActive      bool
+	FindKeys        []uint64 // Object handles from current find operation
+	CachedSignature []byte   // Result of the length-query C_Sign; consumed by the follow-up data-copy call
 }
 
 // Object represents a key object
@@ -103,6 +104,34 @@ func Finalize() {
 // GetBackend returns the global backend instance
 func GetBackend() *Backend {
 	return globalBackend
+}
+
+// CacheSignature stores the signature from the length-query C_Sign call into
+// the session so the follow-up data-copy call can reuse it without a second
+// BLE round-trip. Keyed by session handle to prevent cross-session confusion.
+func (b *Backend) CacheSignature(sessionHandle uint64, sig []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	session, exists := b.sessions[sessionHandle]
+	if !exists {
+		return fmt.Errorf("invalid session handle: %d", sessionHandle)
+	}
+	session.CachedSignature = sig
+	return nil
+}
+
+// TakeCachedSignature retrieves and clears the cached signature for a session.
+// Returns nil if no signature is cached.
+func (b *Backend) TakeCachedSignature(sessionHandle uint64) []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	session, exists := b.sessions[sessionHandle]
+	if !exists {
+		return nil
+	}
+	sig := session.CachedSignature
+	session.CachedSignature = nil
+	return sig
 }
 
 // ensureConnected starts the BLE connection manager if not already started,
@@ -400,18 +429,28 @@ func (b *Backend) extractEd25519PublicKey(blob []byte) []byte {
 	return blob[offset : offset+32]
 }
 
-// Sign performs Ed25519 signature via BLE (SIGN_REQUEST)
+// Sign performs Ed25519 signature via BLE (SIGN_REQUEST).
+// When objectHandle is 0 the key handle is resolved from the session's SignKeyHandle,
+// which was set by SignInit — this keeps key state per-session and out of C globals.
 func (b *Backend) Sign(sessionHandle uint64, objectHandle uint64, data []byte) ([]byte, error) {
 	log.Printf("[PKCS11] Sign: session=%d object=%d data_len=%d", sessionHandle, objectHandle, len(data))
-	
+
 	b.mu.RLock()
-	_, sessionExists := b.sessions[sessionHandle]
+	session, sessionExists := b.sessions[sessionHandle]
+	if sessionExists && objectHandle == 0 {
+		objectHandle = session.SignKeyHandle
+	}
 	obj, objExists := b.objects[objectHandle]
 	b.mu.RUnlock()
 
 	if !sessionExists {
 		log.Printf("[PKCS11] Invalid session handle: %d", sessionHandle)
 		return nil, fmt.Errorf("invalid session handle")
+	}
+
+	if objectHandle == 0 {
+		log.Printf("[PKCS11] Sign called without prior SignInit on session %d", sessionHandle)
+		return nil, fmt.Errorf("sign operation not initialized")
 	}
 
 	if !objExists || obj.Class != CKO_PRIVATE_KEY {

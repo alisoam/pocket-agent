@@ -295,8 +295,7 @@ extern CK_RV GoSign(CK_SESSION_HANDLE hSession, CK_OBJECT_HANDLE hKey, CK_BYTE_P
 /* User types */
 #define CKU_USER                          1
 
-/* Global state */
-static CK_OBJECT_HANDLE current_sign_key = 0;
+/* (no per-process sign-key global; key handle is stored per-session in the Go backend) */
 
 /* Helper to pad string with spaces */
 static void pad_string(CK_UTF8CHAR *dest, const char *src, size_t len) {
@@ -596,10 +595,6 @@ CK_RV C_SignInit(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism, CK_OBJ
     if (pMechanism == NULL) {
         return CKR_ARGUMENTS_BAD;
     }
-    
-    /* Store key handle for C_Sign */
-    current_sign_key = hKey;
-    
     return GoSignInit(hSession, pMechanism->mechanism, hKey);
 }
 
@@ -608,12 +603,8 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData, CK_ULONG ulDataLen, 
     if (pData == NULL || pulSignatureLen == NULL) {
         return CKR_ARGUMENTS_BAD;
     }
-    
-    if (current_sign_key == 0) {
-        return CKR_OPERATION_NOT_INITIALIZED;
-    }
-    
-    return GoSign(hSession, current_sign_key, pData, ulDataLen, pSignature, pulSignatureLen);
+    /* Pass hKey=0; GoSign resolves the key from the session's SignKeyHandle. */
+    return GoSign(hSession, 0, pData, ulDataLen, pSignature, pulSignatureLen);
 }
 
 /* Unsupported functions - return not supported */
