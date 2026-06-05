@@ -2,8 +2,13 @@ package ble
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
@@ -47,9 +52,11 @@ type Client struct {
 	pendingCorrID [4]byte // protected by rxMu
 	rxMu          sync.Mutex
 
-	connected bool
-	scanning  bool // true while adapter.Scan is in progress; protected by mu
-	mu        sync.Mutex
+	connected     bool
+	scanning      bool     // true while adapter.Scan is in progress; protected by mu
+	sessionActive bool     // true after ECDH key exchange; protected by mu
+	sessionKey    [32]byte // AES-256-GCM session key; protected by mu
+	mu            sync.Mutex
 }
 
 // NewClient creates a new BLE client.
@@ -166,11 +173,21 @@ func (c *Client) Connect() error {
 	return nil
 }
 
-// Authenticate sends a POCKET_AUTH_REQUEST to the phone.
-// The phone verifies the signature and checks its trust store.
-// Returns nil on success, error if rejected.
+// Authenticate sends a POCKET_AUTH_REQUEST to the phone and performs an
+// ephemeral ECDH key exchange to establish a per-session AES-256-GCM key.
+//
+// Protocol (type 100 request):
+//
+//	byte(100) | string(x509_pubkey) | string(nonce) | string(ed25519_sig) | string(x25519_ephemeral_pub)
+//
+// Protocol (type 101 success response):
+//
+//	byte(101) | string(x25519_ephemeral_pub_phone)
+//
+// After this call all messages sent via SendMessage are encrypted with
+// AES-256-GCM using a key derived from the ECDH shared secret.
 func (c *Client) Authenticate(privateKey ed25519.PrivateKey) error {
-	// Generate random nonce
+	// Generate random nonce (also used as HKDF salt)
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
 		return fmt.Errorf("failed to generate nonce: %w", err)
@@ -186,12 +203,21 @@ func (c *Client) Authenticate(privateKey ed25519.PrivateKey) error {
 		return fmt.Errorf("failed to marshal public key: %w", err)
 	}
 
-	// Build auth message: byte(100) | string(pubkey) | string(nonce) | string(signature)
+	// Generate ephemeral X25519 keypair for ECDH
+	ephemPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return fmt.Errorf("failed to generate X25519 key: %w", err)
+	}
+	ephemPub := ephemPriv.PublicKey().Bytes() // 32 bytes
+
+	// Build auth message: byte(100) | string(pubkey) | string(nonce) | string(sig) | string(x25519_pub)
 	msg := []byte{100} // POCKET_AUTH_REQUEST
 	msg = append(msg, encodeString(x509PubKey)...)
 	msg = append(msg, encodeString(nonce)...)
 	msg = append(msg, encodeString(signature)...)
+	msg = append(msg, encodeString(ephemPub)...)
 
+	// SendMessage is called before sessionActive=true, so this goes out plaintext.
 	response, err := c.SendMessage(msg)
 	if err != nil {
 		return fmt.Errorf("auth request failed: %w", err)
@@ -202,9 +228,34 @@ func (c *Client) Authenticate(privateKey ed25519.PrivateKey) error {
 	}
 
 	switch response[0] {
-	case 101: // POCKET_AUTH_SUCCESS
-		log.Println("Authentication successful")
+	case 101: // POCKET_AUTH_SUCCESS — response carries phone's X25519 ephemeral pubkey
+		if len(response) < 5 {
+			return fmt.Errorf("auth success response missing X25519 key")
+		}
+		keyLen := int(binary.BigEndian.Uint32(response[1:5]))
+		if len(response) < 5+keyLen {
+			return fmt.Errorf("auth success response X25519 key truncated")
+		}
+		phonePub, err := ecdh.X25519().NewPublicKey(response[5 : 5+keyLen])
+		if err != nil {
+			return fmt.Errorf("invalid phone X25519 key: %w", err)
+		}
+
+		shared, err := ephemPriv.ECDH(phonePub)
+		if err != nil {
+			return fmt.Errorf("ECDH failed: %w", err)
+		}
+
+		derived := deriveSessionKey(shared, nonce)
+
+		c.mu.Lock()
+		c.sessionKey = derived
+		c.sessionActive = true
+		c.mu.Unlock()
+
+		log.Println("Authentication successful — session key established (AES-256-GCM)")
 		return nil
+
 	case 102: // POCKET_AUTH_FAILURE
 		return fmt.Errorf("authentication rejected: device not trusted (removed from phone?)")
 	default:
@@ -221,12 +272,16 @@ func encodeString(data []byte) []byte {
 
 // SendMessage sends an agent message and waits for the response.
 // Implements the agent.Transport interface.
+// When a session key is active (post-Authenticate) the payload is encrypted
+// with AES-256-GCM and the response is decrypted before returning.
 func (c *Client) SendMessage(msg []byte) ([]byte, error) {
 	c.mu.Lock()
 	if !c.connected {
 		c.mu.Unlock()
 		return nil, fmt.Errorf("not connected")
 	}
+	active := c.sessionActive
+	key := c.sessionKey // copy while holding mu
 	c.mu.Unlock()
 
 	// Drain any stale response left from a previous operation (e.g. a late
@@ -247,16 +302,26 @@ func (c *Client) SendMessage(msg []byte) ([]byte, error) {
 	c.pendingCorrID = corrID
 	c.rxMu.Unlock()
 
-	// Frame: [4B ble_len][4B corr_id][msg]
-	payload := make([]byte, 4+len(msg))
+	// Encrypt the message when a session key is active.
+	outgoing := msg
+	if active {
+		var err error
+		outgoing, err = sealAESGCM(key, msg)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt: %w", err)
+		}
+	}
+
+	// Frame: [4B ble_len][4B corr_id][outgoing]
+	payload := make([]byte, 4+len(outgoing))
 	copy(payload[:4], corrID[:])
-	copy(payload[4:], msg)
+	copy(payload[4:], outgoing)
 	framed := make([]byte, 4+len(payload))
 	binary.BigEndian.PutUint32(framed[0:4], uint32(len(payload)))
 	copy(framed[4:], payload)
 
 	// Send in MTU-sized chunks
-	log.Printf("BLE: sending message (%d bytes, type=%d) in %d-byte chunks", len(msg), msg[0], c.mtu)
+	log.Printf("BLE: sending message (%d bytes, type=%d, encrypted=%v) in %d-byte chunks", len(msg), msg[0], active, c.mtu)
 	for offset := 0; offset < len(framed); offset += c.mtu {
 		end := offset + c.mtu
 		if end > len(framed) {
@@ -281,6 +346,9 @@ func (c *Client) SendMessage(msg []byte) ([]byte, error) {
 	}
 	select {
 	case response := <-c.responseCh:
+		if active {
+			return openAESGCM(key, response)
+		}
 		return response, nil
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("timeout waiting for response")
@@ -317,6 +385,63 @@ func (c *Client) Disconnect() {
 		c.device.Disconnect()
 		c.connected = false
 	}
+
+	// Clear session key so a reconnect starts a fresh ECDH exchange
+	c.sessionActive = false
+	c.sessionKey = [32]byte{}
+}
+
+// deriveSessionKey produces a 32-byte AES-256 key from an X25519 shared secret
+// using HKDF-SHA256 (RFC 5869).  The nonce from the auth handshake is the salt
+// so the derived key is bound to this specific session.
+func deriveSessionKey(sharedSecret, salt []byte) [32]byte {
+	// HKDF-Extract: PRK = HMAC-SHA256(salt, IKM)
+	prk := hmac.New(sha256.New, salt)
+	prk.Write(sharedSecret)
+	extracted := prk.Sum(nil)
+
+	// HKDF-Expand: OKM = HMAC-SHA256(PRK, info || 0x01)  (single 32-byte block)
+	okm := hmac.New(sha256.New, extracted)
+	okm.Write([]byte("pocket-ssh-session-v1\x01"))
+	var key [32]byte
+	copy(key[:], okm.Sum(nil))
+	return key
+}
+
+// sealAESGCM encrypts plaintext with AES-256-GCM.
+// Output layout: [12B nonce][ciphertext][16B auth tag]
+func sealAESGCM(key [32]byte, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize()) // 12 bytes
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	// Seal prepends nonce then appends ciphertext+tag
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// openAESGCM decrypts an AES-256-GCM ciphertext produced by sealAESGCM.
+func openAESGCM(key [32]byte, data []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonceSize := gcm.NonceSize()
+	if len(data) < nonceSize+gcm.Overhead() {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+	return gcm.Open(nil, data[:nonceSize], data[nonceSize:], nil)
 }
 
 func (c *Client) handleNotification(buf []byte) {

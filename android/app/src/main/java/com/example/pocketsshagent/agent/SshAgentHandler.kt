@@ -3,6 +3,7 @@ package com.example.pocketsshagent.agent
 import android.util.Base64
 import android.util.Log
 import com.example.pocketsshagent.crypto.KeyManager
+import com.example.pocketsshagent.crypto.SessionCrypto
 import com.example.pocketsshagent.pairing.TrustStore
 import java.security.KeyFactory
 import java.security.Signature
@@ -25,10 +26,12 @@ class SshAgentHandler(
 
     private var authenticated = false
     private var authenticatedDeviceKey: String? = null
+    private var sessionCrypto: SessionCrypto? = null
 
     fun resetSession() {
         authenticated = false
         authenticatedDeviceKey = null
+        sessionCrypto = null
     }
 
     fun handleMessage(message: ByteArray, onResponse: (ByteArray) -> Unit) {
@@ -37,17 +40,56 @@ class SshAgentHandler(
             return
         }
 
-        when (AgentMessageParser.messageType(message)) {
-            AgentMessageType.POCKET_AUTH_REQUEST -> handleAuthRequest(message, onResponse)
+        // Auth message always arrives in plaintext — it establishes the session key
+        if (AgentMessageParser.messageType(message) == AgentMessageType.POCKET_AUTH_REQUEST) {
+            handleAuthRequest(message, onResponse)
+            return
+        }
+
+        // Decrypt incoming message when a session key is active
+        val crypto = sessionCrypto
+        val plaintext: ByteArray = if (crypto != null) {
+            try {
+                crypto.open(message)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to decrypt incoming message", e)
+                onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+                return
+            }
+        } else {
+            message
+        }
+
+        if (plaintext.isEmpty()) {
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            return
+        }
+
+        // Wrap onResponse to encrypt outgoing responses when a session is active.
+        // Incoming framed = [4B len][raw]; strip len, encrypt raw, re-frame.
+        val respond: (ByteArray) -> Unit = if (crypto != null) { framed ->
+            val raw = framed.copyOfRange(4, framed.size)
+            val encrypted = try {
+                crypto.seal(raw)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to encrypt response", e)
+                raw
+            }
+            onResponse(SshWireFormat.frameMessage(encrypted))
+        } else {
+            onResponse
+        }
+
+        when (AgentMessageParser.messageType(plaintext)) {
             AgentMessageType.SSH_AGENTC_REQUEST_IDENTITIES -> {
-                if (!requireAuth(onResponse)) return
-                onResponse(SshWireFormat.frameMessage(handleRequestIdentities()))
+                if (!requireAuth(respond)) return
+                respond(SshWireFormat.frameMessage(handleRequestIdentities()))
             }
             AgentMessageType.SSH_AGENTC_SIGN_REQUEST -> {
-                if (!requireAuth(onResponse)) return
-                handleSignRequest(message, onResponse)
+                if (!requireAuth(respond)) return
+                handleSignRequest(plaintext, respond)
             }
-            else -> onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            else -> respond(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
         }
     }
 
@@ -96,11 +138,23 @@ class SshAgentHandler(
             return
         }
 
+        // ECDH key exchange: derive per-session AES-256-GCM key
+        val (crypto, ourPubRaw) = try {
+            SessionCrypto.establish(authRequest.x25519EphemeralKey, authRequest.nonce)
+        } catch (e: Exception) {
+            Log.e(TAG, "ECDH key exchange failed", e)
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authFailure()))
+            return
+        }
+
         authenticated = true
         authenticatedDeviceKey = publicKeyBase64
+        sessionCrypto = crypto
         trustStore?.updateLastSeen(publicKeyBase64)
-        Log.i(TAG, "Session authenticated for device: $publicKeyBase64")
-        onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authSuccess()))
+        Log.i(TAG, "Session authenticated and encrypted (AES-256-GCM) for device: $publicKeyBase64")
+
+        // 101 response carries phone's ephemeral X25519 pubkey (plaintext — session starts after this)
+        onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authSuccess(ourPubRaw)))
     }
 
     private fun handleRequestIdentities(): ByteArray {

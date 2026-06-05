@@ -37,12 +37,13 @@ data class SignRequest(
 
 /**
  * Parsed auth request from the proxy.
- * Format: byte type | string publicKey (X.509) | string nonce | string signature
+ * Format: byte type | string publicKey (X.509) | string nonce | string signature | string x25519EphemeralKey
  */
 data class AuthRequest(
     val publicKey: ByteArray,
     val nonce: ByteArray,
-    val signature: ByteArray
+    val signature: ByteArray,
+    val x25519EphemeralKey: ByteArray  // proxy's raw 32-byte X25519 ephemeral public key
 )
 
 /** Parse a raw agent message (after length prefix is removed). */
@@ -79,19 +80,18 @@ object AgentMessageParser {
 
     /**
      * Parse a POCKET_AUTH_REQUEST message.
-     * Format: byte type | string publicKey | string nonce | string signature
+     * Format: byte type | string publicKey | string nonce | string signature | string x25519EphemeralKey
      */
     fun parseAuthRequest(message: ByteArray): AuthRequest {
         require(message[0] == AgentMessageType.POCKET_AUTH_REQUEST) {
             "Not an auth request"
         }
         var offset = 1
-        val (publicKey, off1) = SshWireFormat.decodeString(message, offset)
-        offset = off1
-        val (nonce, off2) = SshWireFormat.decodeString(message, offset)
-        offset = off2
-        val (signature, _) = SshWireFormat.decodeString(message, offset)
-        return AuthRequest(publicKey, nonce, signature)
+        val (publicKey, off1) = SshWireFormat.decodeString(message, offset); offset = off1
+        val (nonce, off2) = SshWireFormat.decodeString(message, offset); offset = off2
+        val (signature, off3) = SshWireFormat.decodeString(message, offset); offset = off3
+        val (x25519Key, _) = SshWireFormat.decodeString(message, offset)
+        return AuthRequest(publicKey, nonce, signature, x25519Key)
     }
 }
 
@@ -135,8 +135,12 @@ object AgentMessageBuilder {
                SshWireFormat.encodeString(encodedSig)
     }
 
-    /** Build POCKET_AUTH_SUCCESS response. */
-    fun authSuccess(): ByteArray = byteArrayOf(AgentMessageType.POCKET_AUTH_SUCCESS)
+    /**
+     * Build POCKET_AUTH_SUCCESS response carrying the phone's ephemeral X25519 public key.
+     * Format: byte(101) | string(phoneX25519EphemeralPub)
+     */
+    fun authSuccess(phoneEphemeralPub: ByteArray): ByteArray =
+        byteArrayOf(AgentMessageType.POCKET_AUTH_SUCCESS) + SshWireFormat.encodeString(phoneEphemeralPub)
 
     /** Build POCKET_AUTH_FAILURE response. */
     fun authFailure(): ByteArray = byteArrayOf(AgentMessageType.POCKET_AUTH_FAILURE)
