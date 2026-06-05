@@ -17,7 +17,11 @@ import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import com.example.pocketsshagent.MainActivity
 import android.os.Binder
@@ -153,13 +157,53 @@ class BleAgentService : Service() {
         getSystemService(NotificationManager::class.java).notify(SIGN_NOTIFICATION_ID, notification)
     }
 
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_ON -> {
+                    Log.i(TAG, "Bluetooth enabled, restarting BLE stack")
+                    restartBleStack()
+                }
+                BluetoothAdapter.STATE_OFF -> {
+                    Log.i(TAG, "Bluetooth disabled, cleaning up BLE state")
+                    cleanupBleState()
+                }
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         bluetoothManager = getSystemService(BluetoothManager::class.java)
         trustStore = TrustStore(this)
         keyManager = KeyManager(this)
+        registerReceiver(bluetoothStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
+    }
+
+    private fun cleanupBleState() {
+        // Explicitly stop advertising so Android doesn't auto-restore the session
+        // when Bluetooth is re-enabled, which would cause ALREADY_STARTED on restart.
+        if (hasBluetoothPermission()) {
+            try { advertiser?.stopAdvertising(advertiseCallback) } catch (_: Exception) {}
+        }
+        advertiser = null
+        gattServer?.close()
+        gattServer = null
+        isAdvertising = false
+        subscribedDevices.clear()
+        deviceAssemblers.clear()
+        deviceMtu.clear()
+        deviceHandlers.clear()
+        cancelPendingSignRequest()
+    }
+
+    private fun restartBleStack() {
+        cleanupBleState()
+        startGattServer()
+        startAdvertising()
     }
 
     private fun createAgentHandler(addr: String): SshAgentHandler {
@@ -191,15 +235,9 @@ class BleAgentService : Service() {
     }
 
     override fun onDestroy() {
+        unregisterReceiver(bluetoothStateReceiver)
         mainHandler.removeCallbacks(signTimeoutRunnable)
-        cancelPendingSignRequest()
-        stopAdvertising()
-        gattServer?.close()
-        gattServer = null
-        subscribedDevices.clear()
-        deviceAssemblers.clear()
-        deviceMtu.clear()
-        deviceHandlers.clear()
+        cleanupBleState()
         super.onDestroy()
     }
 
@@ -406,8 +444,14 @@ class BleAgentService : Service() {
         }
 
         override fun onStartFailure(errorCode: Int) {
-            isAdvertising = false
-            Log.e(TAG, "Advertising failed with error code: $errorCode")
+            if (errorCode == ADVERTISE_FAILED_ALREADY_STARTED) {
+                // Android auto-restored a previous advertising session; treat as success.
+                isAdvertising = true
+                Log.i(TAG, "Advertising already active (restored by system)")
+            } else {
+                isAdvertising = false
+                Log.e(TAG, "Advertising failed with error code: $errorCode")
+            }
         }
     }
 
