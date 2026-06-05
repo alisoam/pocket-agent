@@ -151,7 +151,7 @@ class SshAgentHandler(
         authenticatedDeviceKey = publicKeyBase64
         sessionCrypto = crypto
         trustStore?.updateLastSeen(publicKeyBase64)
-        Log.i(TAG, "Session authenticated and encrypted (AES-256-GCM) for device: $publicKeyBase64")
+        Log.i(TAG, "Session authenticated and encrypted (AES-256-GCM) for device: ${publicKeyBase64.take(8)}…")
 
         // 101 response carries phone's ephemeral X25519 pubkey (plaintext — session starts after this)
         onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authSuccess(ourPubRaw)))
