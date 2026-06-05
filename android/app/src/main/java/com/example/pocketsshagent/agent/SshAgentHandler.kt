@@ -94,7 +94,6 @@ class SshAgentHandler(
     }
 
     private fun requireAuth(onResponse: (ByteArray) -> Unit): Boolean {
-        if (trustStore == null) return true
         if (!authenticated) {
             Log.w(TAG, "Rejecting request: session not authenticated")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authFailure()))
@@ -104,6 +103,14 @@ class SshAgentHandler(
     }
 
     private fun handleAuthRequest(message: ByteArray, onResponse: (ByteArray) -> Unit) {
+        // BLE notification retransmissions can deliver the same auth request multiple times.
+        // Each call generates a fresh X25519 keypair, which would overwrite the session key
+        // already established with the proxy, causing a key mismatch on the next request.
+        if (authenticated) {
+            Log.w(TAG, "Ignoring duplicate auth request; session already established")
+            return
+        }
+
         val authRequest = try {
             AgentMessageParser.parseAuthRequest(message)
         } catch (e: Exception) {
