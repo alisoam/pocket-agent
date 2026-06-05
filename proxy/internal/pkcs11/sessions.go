@@ -9,41 +9,50 @@ import (
 // FindObjectsInit starts object enumeration
 func (b *Backend) FindObjectsInit(sessionHandle uint64, class uint64) error {
 	log.Printf("[PKCS11] FindObjectsInit: session=%d class=0x%x", sessionHandle, class)
-	
-	b.mu.Lock()
-	defer b.mu.Unlock()
 
+	// Phase 1: validate session and snapshot whether a key load is needed.
+	// Release the lock before calling LoadKeys, which acquires it internally.
+	b.mu.Lock()
 	session, exists := b.sessions[sessionHandle]
 	if !exists {
+		b.mu.Unlock()
 		log.Printf("[PKCS11] Invalid session: %d", sessionHandle)
 		return fmt.Errorf("invalid session")
 	}
-
 	if session.FindActive {
+		b.mu.Unlock()
 		log.Println("[PKCS11] Find operation already active")
 		return fmt.Errorf("find operation already active")
 	}
+	needLoad := len(b.objects) == 0
+	b.mu.Unlock()
 
-	// Load keys from Android if not done yet
-	if len(b.objects) == 0 {
+	// Phase 2: load keys if needed (LoadKeys manages its own lock).
+	if needLoad {
 		log.Println("[PKCS11] No objects cached, loading from Android...")
-		b.mu.Unlock()
 		if err := b.LoadKeys(); err != nil {
-			b.mu.Lock()
 			log.Printf("[PKCS11] Failed to load keys: %v", err)
 			return err
 		}
-		b.mu.Lock()
 	}
 
-	// Filter objects by class (0 = all objects)
+	// Phase 3: build find result set.
+	// Re-validate session: it may have been closed during the unlock window.
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	session, exists = b.sessions[sessionHandle]
+	if !exists {
+		log.Printf("[PKCS11] Session closed during key load: %d", sessionHandle)
+		return fmt.Errorf("invalid session")
+	}
+
 	session.FindKeys = []uint64{}
 	for handle, obj := range b.objects {
 		if class == 0 || obj.Class == class {
 			session.FindKeys = append(session.FindKeys, handle)
 		}
 	}
-
 	session.FindActive = true
 	log.Printf("[PKCS11] Find initialized: %d object(s) match", len(session.FindKeys))
 	return nil
