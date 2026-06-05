@@ -1,2 +1,7 @@
 .DS_Store
 proxy/pocket-agent
+
+# Compiled binaries
+*.o
+*.a
+*.so
