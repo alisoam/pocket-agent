@@ -1,0 +1,4 @@
+provider.o
+libbridge.h
+libbridge.a
+libpocket-pkcs11.so
