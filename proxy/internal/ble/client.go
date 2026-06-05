@@ -19,6 +19,11 @@ import (
 	"tinygo.org/x/bluetooth"
 )
 
+// maxBleFrameBytes caps the declared payload length in an incoming BLE frame.
+// Prevents OOM from a malicious or malformed 4-byte length field.
+// Legitimate SSH agent messages (key blobs, signatures) are well under 64 KB.
+const maxBleFrameBytes = 64 * 1024
+
 var (
 	ServiceUUID = bluetooth.NewUUID([16]byte{
 		0xa1, 0x1e, 0x1f, 0x4e, 0xc8, 0xa0, 0x4d, 0x3b,
@@ -458,7 +463,13 @@ func (c *Client) handleNotification(buf []byte) {
 	}
 
 	if c.rxExpected == 0 {
-		c.rxExpected = int(binary.BigEndian.Uint32(c.rxBuf[0:4]))
+		declared := int(binary.BigEndian.Uint32(c.rxBuf[0:4]))
+		if declared > maxBleFrameBytes {
+			log.Printf("BLE: oversized frame declared (%d bytes > %d limit), dropping", declared, maxBleFrameBytes)
+			c.rxBuf = nil
+			return
+		}
+		c.rxExpected = declared
 	}
 
 	totalNeeded := 4 + c.rxExpected

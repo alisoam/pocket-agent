@@ -1,5 +1,6 @@
 package com.example.pocketsshagent.ble
 
+import android.util.Log
 import com.example.pocketsshagent.agent.SshWireFormat
 import java.io.ByteArrayOutputStream
 
@@ -21,6 +22,12 @@ class BleFrameAssembler {
     private val buffer = ByteArrayOutputStream()
     private var expectedLength: Int = -1
 
+    companion object {
+        private const val TAG = "BleFrameAssembler"
+        // Mirrors maxBleFrameBytes in the Go proxy — prevents OOM from a bogus length field.
+        private const val MAX_FRAME_BYTES = 64 * 1024
+    }
+
     /**
      * Feed incoming chunk data. Returns a complete message (without the
      * 4-byte length prefix) when fully assembled, or null if more data needed.
@@ -34,7 +41,13 @@ class BleFrameAssembler {
         if (accumulated.size < 4) return null
 
         if (expectedLength < 0) {
-            expectedLength = SshWireFormat.decodeUint32(accumulated, 0)
+            val declared = SshWireFormat.decodeUint32(accumulated, 0)
+            if (declared > MAX_FRAME_BYTES) {
+                Log.w(TAG, "Oversized frame declared ($declared bytes > $MAX_FRAME_BYTES limit), dropping")
+                reset()
+                return null
+            }
+            expectedLength = declared
         }
 
         val totalNeeded = 4 + expectedLength
