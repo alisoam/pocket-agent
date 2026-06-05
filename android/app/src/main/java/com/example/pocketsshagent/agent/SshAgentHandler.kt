@@ -16,7 +16,8 @@ interface AgentCallback {
 class SshAgentHandler(
     private val keyManager: KeyManager,
     private val callback: AgentCallback,
-    private val trustStore: TrustStore? = null
+    private val trustStore: TrustStore? = null,
+    private val signingInProgress: AtomicBoolean = AtomicBoolean(false)
 ) {
     companion object {
         private const val TAG = "SshAgentHandler"
@@ -24,12 +25,10 @@ class SshAgentHandler(
 
     private var authenticated = false
     private var authenticatedDeviceKey: String? = null
-    private val signingInProgress = AtomicBoolean(false)
 
     fun resetSession() {
         authenticated = false
         authenticatedDeviceKey = null
-        signingInProgress.set(false)
     }
 
     fun handleMessage(message: ByteArray, onResponse: (ByteArray) -> Unit) {

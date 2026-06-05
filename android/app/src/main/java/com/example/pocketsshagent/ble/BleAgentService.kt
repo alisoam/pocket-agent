@@ -31,6 +31,7 @@ import com.example.pocketsshagent.agent.SshAgentHandler
 import com.example.pocketsshagent.agent.SshWireFormat
 import com.example.pocketsshagent.crypto.KeyManager
 import com.example.pocketsshagent.pairing.TrustStore
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Foreground service that runs a BLE GATT server implementing the SSH agent protocol.
@@ -63,11 +64,18 @@ class BleAgentService : Service() {
     private lateinit var bluetoothManager: BluetoothManager
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
-    private lateinit var agentHandler: SshAgentHandler
+    private lateinit var trustStore: TrustStore
+    private lateinit var keyManager: KeyManager
+
+    // One lock shared across all per-device handlers — only one biometric at a time.
+    private val signingInProgress = AtomicBoolean(false)
+    // Which device addr currently holds the signing lock (null when idle).
+    @Volatile private var signingDeviceAddr: String? = null
 
     // Per-device state
     private val deviceAssemblers = mutableMapOf<String, BleFrameAssembler>()
     private val deviceMtu = mutableMapOf<String, Int>()
+    private val deviceHandlers = mutableMapOf<String, SshAgentHandler>()
     private val subscribedDevices = mutableSetOf<BluetoothDevice>()
 
     private var txCharacteristic: BluetoothGattCharacteristic? = null
@@ -148,22 +156,28 @@ class BleAgentService : Service() {
     override fun onCreate() {
         super.onCreate()
         bluetoothManager = getSystemService(BluetoothManager::class.java)
-        val trustStore = TrustStore(this)
-        agentHandler = SshAgentHandler(KeyManager(this), object : AgentCallback {
+        trustStore = TrustStore(this)
+        keyManager = KeyManager(this)
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildNotification())
+    }
+
+    private fun createAgentHandler(addr: String): SshAgentHandler {
+        return SshAgentHandler(keyManager, object : AgentCallback {
             override fun requestBiometricSign(alias: String, keyLabel: String, deviceName: String?, data: ByteArray, onResult: (ByteArray?) -> Unit) {
-                // Delegate to the activity-provided callback, or deny
                 val cb = agentCallback
                 if (cb != null) {
-                    cb.requestBiometricSign(alias, keyLabel, deviceName, data, onResult)
+                    signingDeviceAddr = addr
+                    cb.requestBiometricSign(alias, keyLabel, deviceName, data) { signature ->
+                        if (signingDeviceAddr == addr) signingDeviceAddr = null
+                        onResult(signature)
+                    }
                 } else {
                     Log.w(TAG, "No AgentCallback set, denying sign request")
                     onResult(null)
                 }
             }
-        }, trustStore)
-
-        createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        }, trustStore, signingInProgress)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -185,6 +199,7 @@ class BleAgentService : Service() {
         subscribedDevices.clear()
         deviceAssemblers.clear()
         deviceMtu.clear()
+        deviceHandlers.clear()
         super.onDestroy()
     }
 
@@ -237,8 +252,14 @@ class BleAgentService : Service() {
                 val addr = device.address
                 deviceAssemblers.remove(addr)
                 deviceMtu.remove(addr)
+                deviceHandlers.remove(addr)
                 subscribedDevices.remove(device)
-                agentHandler.resetSession()
+                // If this device held the foreground signing lock, release it.
+                if (signingDeviceAddr == addr) {
+                    signingInProgress.set(false)
+                    signingDeviceAddr = null
+                }
+                cancelPendingSignRequest()
                 Log.i(TAG, "Device disconnected: $addr")
             } else if (newState == BluetoothGatt.STATE_CONNECTED) {
                 // Don't reset session on connect - STATE_CONNECTED can fire multiple
@@ -318,7 +339,8 @@ class BleAgentService : Service() {
         val correlationId = frame.copyOfRange(0, 4)
         val message = frame.copyOfRange(4, frame.size)
 
-        agentHandler.handleMessage(message) { response ->
+        val handler = deviceHandlers.getOrPut(addr) { createAgentHandler(addr) }
+        handler.handleMessage(message) { response ->
             // response = SshWireFormat.frameMessage(result) = [4B ssh_len][result]
             // Send: [4B ble_len][4B corr_id][4B ssh_len][result]
             val blePayload = correlationId + response
