@@ -1,28 +1,31 @@
 # PocketAgent
 
-Use your Android phone as a hardware SSH key. Ed25519 keys are generated and stored in Android Keystore (StrongBox/TEE) and never leave the device — every SSH authentication requires a biometric tap on the phone. The desktop connects to the phone over Bluetooth Low Energy.
+Use your Android phone as a hardware SSH security key — the same role a YubiKey plays, but over Bluetooth. Ed25519 and ECDSA keys are generated inside Android Keystore (StrongBox/TEE) and never leave the device. Every SSH authentication requires a biometric tap on the phone.
+
+The phone implements the OpenSSH SecurityKey (FIDO2-over-BLE) protocol, so `ssh-keygen`, `ssh`, and any OpenSSH tool treat it exactly like a hardware token.
 
 ## How it works
 
 ```
-SSH Client
-  │
-  ├─ SSH Agent socket (SSH_AUTH_SOCK)  ──┐
-  │                                      ├─► BLE ──► Android App ──► Android Keystore
-  └─ PKCS#11 provider (.so)  ────────────┘
+ssh-keygen / ssh
+      │
+      └─ SecurityKeyProvider (libpocket-sk.so)
+              │
+              └─ BLE ──► Android App ──► Android Keystore (TEE / StrongBox)
 ```
 
-The Android app runs a GATT server that speaks the SSH agent protocol. The Linux proxy connects as a GATT client and exposes the phone's keys to the desktop in two ways:
+When `ssh-keygen -t ed25519-sk` runs, it contacts the SK provider, which relays the request to the phone over BLE. The phone prompts for biometric confirmation, generates the key in Keystore, and returns only the public key and a key handle. The private key never crosses BLE.
 
-- **SSH Agent** — Unix socket; set `SSH_AUTH_SOCK` and all SSH tools work transparently.
-- **PKCS#11** — a shared library any PKCS#11-capable app can load directly, no daemon needed.
+Authentication works the same way: the provider sends the signing input to the phone, the phone shows a biometric prompt, signs inside Keystore, and returns only the signature.
 
 ## Repository layout
 
 ```
 PocketAgent/
 ├── android/   Android app (Kotlin/Compose) — key management, BLE GATT server, biometric signing
-└── proxy/     Linux desktop proxy (Go) — BLE client, SSH agent socket, PKCS#11 provider
+└── proxy/     Linux desktop proxy (Go + C) — BLE client, OpenSSH SK provider
+    ├── cmd/pocket-agent/   CLI for pairing and diagnostics
+    └── sk/                 libpocket-sk.so — OpenSSH SecurityKeyProvider shared library
 ```
 
 ## Android app
@@ -30,52 +33,53 @@ PocketAgent/
 ### Requirements
 
 - Android 16+ (API 36) — required for Ed25519 Android Keystore support
-- Device with StrongBox or TEE (most modern phones)
+- Device with StrongBox or TEE (most modern phones qualify)
 
 ### Setup
 
-1. Build and install the app from `android/` (Android Studio or `./gradlew installDebug`)
-2. Open the app and tap **+** to generate an Ed25519 key
-3. Tap **Pair device** and scan the QR code shown by `pocket-agent pair` on the desktop
-4. The BLE service starts automatically and shows a persistent notification
+1. Build and install from `android/` with Android Studio or `./gradlew installDebug`
+2. Open the app and pair your desktop: tap **Devices → +** and scan the QR code from `pocket-agent pair`
+3. The BLE service starts automatically and shows a persistent notification
 
-### What the app does
+### Key management
 
-- Generates Ed25519 keys inside Android Keystore — private key material is never accessible to app code
-- Runs a BLE GATT server that speaks the SSH agent protocol
-- Shows a biometric prompt (fingerprint/face/PIN) for every sign request
-- Verifies the desktop's identity against a trust store before responding to any request
+Keys can be created in two ways:
+
+- **From the phone** — tap **+** in the key list, choose a label and algorithm (Ed25519 or ECDSA), and the key is generated immediately.
+- **From the desktop** — run `ssh-keygen -t ed25519-sk -w ./libpocket-sk.so`. The phone shows an **Allow / Deny** dialog before generating the key.
+
+Tap a key row to access:
+- **Public Key** — fingerprint and `authorized_keys` line, ready to copy
+- **Key File** — the full OpenSSH private key file (`-----BEGIN OPENSSH PRIVATE KEY-----`) to place in `~/.ssh/id_ed25519_sk`
+- **Rename** — change the display label
+- **Delete** — remove the key from Keystore
 
 ## Desktop proxy
 
 ### Requirements
 
 - Linux with BlueZ (`bluetoothd`) and a BLE adapter
-- Go 1.21+ (to build)
-- GCC (for the PKCS#11 provider only)
+- Go 1.21+
+- GCC (for the SK provider)
 
-### Building
-
-**CLI + SSH Agent:**
+### Build
 
 ```bash
 cd proxy
+
+# CLI (pair, test)
 go build ./cmd/pocket-agent/
-```
 
-**PKCS#11 shared library:**
-
-```bash
-cd proxy/pkcs11
-make
-# produces libpocket-pkcs11.so
+# SK provider shared library
+cd sk && make
+# produces libpocket-sk.so
 ```
 
 ### Pairing (one-time)
 
 ```bash
 ./pocket-agent pair
-# Scan the QR code with the PocketAgent Android app
+# Displays a QR code — scan it with the PocketAgent app
 ```
 
 Options:
@@ -88,85 +92,104 @@ Options:
 
 Keys are stored in `~/.config/pocket-agent/keys/` and reused across sessions.
 
-### SSH Agent mode
-
-Start the proxy:
+### Creating an SSH key
 
 ```bash
-./pocket-agent run
-# prints: export SSH_AUTH_SOCK=/tmp/pocket-agent-1000.sock
+# Ed25519 (recommended)
+ssh-keygen -t ed25519-sk -w ./sk/libpocket-sk.so
+
+# ECDSA P-256
+ssh-keygen -t ecdsa-sk -w ./sk/libpocket-sk.so
 ```
 
-Copy the printed line into your shell, then SSH as normal:
+The phone will show an **Allow / Deny** dialog. On approval it generates the key, and `ssh-keygen` writes the standard key files (`~/.ssh/id_ed25519_sk` and `~/.ssh/id_ed25519_sk.pub`). Alternatively, copy the key file directly from the **Key File** button in the app.
 
-```bash
-export SSH_AUTH_SOCK=/tmp/pocket-agent-1000.sock
-ssh user@server   # biometric prompt appears on phone
-```
-
-`pocket-agent run` options:
-
-```
--socket string   Path for the SSH agent socket (default: /tmp/pocket-agent-<uid>.sock)
--config string   Config directory (default: ~/.config/pocket-agent)
-```
-
-### PKCS#11 mode
+### Using the key
 
 **Option A — per-command flag:**
 
 ```bash
-ssh -I /path/to/libpocket-pkcs11.so user@server
+ssh -i ~/.ssh/id_ed25519_sk -o SecurityKeyProvider=./sk/libpocket-sk.so user@server
 ```
 
-**Option B — load into the running ssh-agent once** (no `-I` flag needed afterwards):
-
-```bash
-ssh-add -q -s /path/to/libpocket-pkcs11.so
-ssh user@server   # phone keys available automatically
-
-# Unload when done:
-ssh-add -e /path/to/libpocket-pkcs11.so
-```
-
-**Option C — `~/.ssh/config` (recommended for permanent setup):**
+**Option B — `~/.ssh/config` (recommended):**
 
 ```
 Host myserver
     HostName server.example.com
     User myuser
-    PKCS11Provider /path/to/libpocket-pkcs11.so
+    IdentityFile ~/.ssh/id_ed25519_sk
+    SecurityKeyProvider /path/to/libpocket-sk.so
 ```
 
-**Other tools:**
+Then just:
 
 ```bash
-# Git
-export GIT_SSH_COMMAND="ssh -I /path/to/libpocket-pkcs11.so"
-git clone git@github.com:user/repo.git
-
-# SCP
-scp -o PKCS11Provider=/path/to/libpocket-pkcs11.so file user@server:
-
-# SFTP
-sftp -o PKCS11Provider=/path/to/libpocket-pkcs11.so user@server
+ssh myserver   # biometric prompt appears on phone
 ```
 
-### Diagnostic
+**Option C — system install:**
 
-Verify BLE connectivity and authentication end-to-end:
+```bash
+cd proxy/sk && sudo make install
+# installs to /usr/local/lib/libpocket-sk.so
+```
+
+Then in `~/.ssh/config`:
+
+```
+SecurityKeyProvider /usr/local/lib/libpocket-sk.so
+```
+
+### Using with ssh-agent
+
+Loading the key into `ssh-agent` lets you authenticate without repeating the `-o SecurityKeyProvider` flag on every command. OpenSSH 8.2+ stores the provider path alongside the key in the agent so sign requests are automatically forwarded to the phone.
+
+**Add the key to the running agent:**
+
+```bash
+ssh-add -S /path/to/libpocket-sk.so ~/.ssh/id_ed25519_sk
+```
+
+The `-S` flag tells the agent which SK provider to call when this key is used for signing. Without it the agent will refuse SK sign requests.
+
+**Verify the key is loaded:**
+
+```bash
+ssh-add -l
+# 256 SHA256:... ali@phone (ED25519-SK)
+```
+
+**Connect — no extra flags needed:**
+
+```bash
+ssh user@server   # agent handles the SK signing, biometric prompt appears on phone
+```
+
+**Agent forwarding** works as normal; the SK provider is invoked locally even when the agent is forwarded to a remote host:
+
+```bash
+ssh -A jumphost
+ssh user@internal   # still prompts on your phone
+```
+
+**Persistent setup** — add to your shell profile so the key is loaded on login:
+
+```bash
+# ~/.bashrc or ~/.zshrc
+ssh-add -S /path/to/libpocket-sk.so ~/.ssh/id_ed25519_sk 2>/dev/null
+```
+
+### Diagnostics
 
 ```bash
 ./pocket-agent test
-# [1/4] Device keys loaded
-# [2/4] BLE connected
-# [3/4] Authenticated with phone
-# [4/4] Phone has 2 key(s) available
+# [1/3] Device keys loaded
+# [2/3] BLE connected
+# [3/3] Authenticated (AES-256-GCM session established)
 ```
 
 ### Configuration
-
-Config directory: `~/.config/pocket-agent/` (override with `-config`)
 
 ```
 ~/.config/pocket-agent/
@@ -177,39 +200,49 @@ Config directory: `~/.config/pocket-agent/` (override with `-config`)
 
 Generated automatically on first `pair` run.
 
+## Security
+
+- **Private keys never leave the phone.** Signing happens inside Android Keystore (StrongBox/TEE); only the signature crosses BLE.
+- **Per-sign biometric.** Every SSH authentication requires a fresh fingerprint/face/PIN approval — no caching, no session window.
+- **Explicit enrollment confirmation.** The phone shows an Allow/Deny dialog before generating any new key, whether requested locally or by `ssh-keygen`.
+- **Mutual authentication.** The desktop must prove its identity with its Ed25519 device key before the phone responds to any request. Only paired devices are trusted.
+- **Encrypted transport.** After authentication, all BLE traffic is encrypted with AES-256-GCM using an X25519 ECDH session key.
+- **QR pairing with signature verification.** The pairing QR payload is signed by the desktop key; the app verifies the signature before adding the device to its trust store.
+
+## Comparison with a YubiKey
+
+PocketAgent and a YubiKey serve the same role for SSH:
+
+| | PocketAgent | YubiKey |
+|---|---|---|
+| Transport | Bluetooth LE | USB / NFC |
+| Key storage | Android Keystore (TEE/StrongBox) | Dedicated security chip |
+| User presence | Biometric (fingerprint/face/PIN) | Physical touch |
+| SSH key types | `ed25519-sk`, `ecdsa-sk` | `ed25519-sk`, `ecdsa-sk` |
+| Works with | OpenSSH 8.2+ | OpenSSH 8.2+ |
+| Key capacity | Limited by Keystore (many keys) | 25 resident keys |
+
+The main practical difference: a YubiKey is always with your USB port; PocketAgent requires BLE range and the phone to be unlocked for biometric. In return it uses a device you already carry and stores keys in hardware already certified on your phone.
+
 ## Troubleshooting
 
 **BLE connection fails**
 
-1. Check Bluetooth is enabled: `bluetoothctl show`
-2. Ensure the Android app is open and the BLE service notification is visible
-3. Phone must be within range (< ~10 m)
-4. Verify pairing: `ls ~/.config/pocket-agent/keys/` — both files must exist
+1. Check Bluetooth is on: `bluetoothctl show`
+2. Ensure the Android app is open and the service notification is visible
+3. Phone must be within BLE range (< ~10 m)
+4. Verify pairing: `ls ~/.config/pocket-agent/keys/` — both `device.key` and `device.pub` must exist
 
 Run `./pocket-agent test` for a step-by-step diagnosis.
 
+**ssh-keygen hangs waiting for the phone**
+
+The phone is showing an Allow/Deny dialog. Check the Android screen and tap **Allow** to proceed.
+
 **SSH hangs after connecting**
 
-The phone is waiting for biometric input. Check the Android screen for a fingerprint/face prompt. If no prompt appears, verify the app has biometric permission in Android settings.
+The phone is waiting for biometric input. Check the Android screen for a fingerprint/face prompt. If no prompt appears, verify the app has notification and biometric permissions in Android Settings.
 
-**Empty key list / "No objects found"**
+**New key not appearing in the app**
 
-1. Open the Android app, tap **+** to create a key
-2. Confirm the BLE service notification is visible
-3. Retry: `pkcs11-tool --module ./libpocket-pkcs11.so --list-objects`
-
-**"CKR_FUNCTION_FAILED" on initialize**
-
-Device keys missing. Regenerate:
-
-```bash
-rm -rf ~/.config/pocket-agent/keys
-./pocket-agent pair
-```
-
-## Security
-
-- **Private keys never leave the phone.** Signing is performed inside Android Keystore (StrongBox/TEE); only the signature crosses BLE.
-- **Per-sign biometric.** Every SSH authentication requires a fresh fingerprint/face/PIN approval — no caching, no session window.
-- **QR pairing with Ed25519 verification.** The QR payload is signed by the desktop key; the app verifies it before adding the device to its trust store.
-- **Session authentication.** The proxy must prove its identity with its device key before the phone responds to any agent request.
+The key list refreshes automatically. If it doesn't update, close and reopen the app.
