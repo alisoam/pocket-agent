@@ -209,21 +209,6 @@ Generated automatically on first `pair` run.
 - **Encrypted transport.** After authentication, all BLE traffic is encrypted with AES-256-GCM using an X25519 ECDH session key.
 - **QR pairing with signature verification.** The pairing QR payload is signed by the desktop key; the app verifies the signature before adding the device to its trust store.
 
-## Comparison with a YubiKey
-
-PocketKey and a YubiKey serve the same role for SSH:
-
-| | PocketKey | YubiKey |
-|---|---|---|
-| Transport | Bluetooth LE | USB / NFC |
-| Key storage | Android Keystore (TEE/StrongBox) | Dedicated security chip |
-| User presence | Biometric (fingerprint/face/PIN) | Physical touch |
-| SSH key types | `ed25519-sk`, `ecdsa-sk` | `ed25519-sk`, `ecdsa-sk` |
-| Works with | OpenSSH 8.2+ | OpenSSH 8.2+ |
-| Key capacity | Limited by Keystore (many keys) | 25 resident keys |
-
-The main practical difference: a YubiKey is always with your USB port; PocketKey requires BLE range and the phone to be unlocked for biometric. In return it uses a device you already carry and stores keys in hardware already certified on your phone.
-
 ## Troubleshooting
 
 **BLE connection fails**
