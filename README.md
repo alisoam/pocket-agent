@@ -1,5 +1,7 @@
 # PocketKey
 
+> **Note:** This is a hobby project — not audited, not production-ready. Use at your own risk.
+
 Use your Android phone as a hardware SSH security key — the same role a YubiKey plays, but over Bluetooth. Ed25519 and ECDSA keys are generated inside Android Keystore (StrongBox/TEE) and never leave the device. Every SSH authentication requires a biometric tap on the phone.
 
 The phone implements the OpenSSH SecurityKey (FIDO2-over-BLE) protocol, so `ssh-keygen`, `ssh`, and any OpenSSH tool treat it exactly like a hardware token.
