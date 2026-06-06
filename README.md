@@ -1,4 +1,4 @@
-# PocketAgent
+# PocketKey
 
 Use your Android phone as a hardware SSH security key — the same role a YubiKey plays, but over Bluetooth. Ed25519 and ECDSA keys are generated inside Android Keystore (StrongBox/TEE) and never leave the device. Every SSH authentication requires a biometric tap on the phone.
 
@@ -21,7 +21,7 @@ Authentication works the same way: the provider sends the signing input to the p
 ## Repository layout
 
 ```
-PocketAgent/
+PocketKey/
 ├── android/   Android app (Kotlin/Compose) — key management, BLE GATT server, biometric signing
 └── proxy/     Linux desktop proxy (Go + C) — BLE client, OpenSSH SK provider
     ├── cmd/pocket-agent/   CLI for pairing and diagnostics
@@ -79,7 +79,7 @@ cd sk && make
 
 ```bash
 ./pocket-agent pair
-# Displays a QR code — scan it with the PocketAgent app
+# Displays a QR code — scan it with the PocketKey app
 ```
 
 Options:
@@ -211,9 +211,9 @@ Generated automatically on first `pair` run.
 
 ## Comparison with a YubiKey
 
-PocketAgent and a YubiKey serve the same role for SSH:
+PocketKey and a YubiKey serve the same role for SSH:
 
-| | PocketAgent | YubiKey |
+| | PocketKey | YubiKey |
 |---|---|---|
 | Transport | Bluetooth LE | USB / NFC |
 | Key storage | Android Keystore (TEE/StrongBox) | Dedicated security chip |
@@ -222,7 +222,7 @@ PocketAgent and a YubiKey serve the same role for SSH:
 | Works with | OpenSSH 8.2+ | OpenSSH 8.2+ |
 | Key capacity | Limited by Keystore (many keys) | 25 resident keys |
 
-The main practical difference: a YubiKey is always with your USB port; PocketAgent requires BLE range and the phone to be unlocked for biometric. In return it uses a device you already carry and stores keys in hardware already certified on your phone.
+The main practical difference: a YubiKey is always with your USB port; PocketKey requires BLE range and the phone to be unlocked for biometric. In return it uses a device you already carry and stores keys in hardware already certified on your phone.
 
 ## Troubleshooting
 
