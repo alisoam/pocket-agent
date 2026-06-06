@@ -6,7 +6,6 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
 import com.example.pocketsshagent.agent.AgentCallback
-import com.example.pocketsshagent.agent.SshWireFormat
 import com.example.pocketsshagent.ble.BleAgentService
 import java.security.KeyStore
 import java.security.PrivateKey
@@ -34,10 +33,42 @@ class BiometricAgentCallback(
         }
     }
 
+    override fun requestEnrollConfirmation(label: String, alg: String, deviceName: String?, onResult: (Boolean) -> Unit) {
+        activity.runOnUiThread {
+            if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                showEnrollDialog(label, alg, deviceName, onResult)
+            } else {
+                Log.d(TAG, "App not in foreground, posting enroll notification for: $label")
+                service.setPendingEnrollRequest(BleAgentService.PendingEnrollRequest(label, alg, deviceName, onResult))
+                service.postEnrollNotification(label, deviceName)
+            }
+        }
+    }
+
     fun resumePendingSign() {
         val req = service.consumePendingSignRequest() ?: return
         Log.d(TAG, "Resuming pending sign request for: ${req.alias}")
         showBiometricPrompt(req.alias, req.keyLabel, req.deviceName, req.data, req.onResult)
+    }
+
+    fun resumePendingEnroll() {
+        val req = service.consumePendingEnrollRequest() ?: return
+        Log.d(TAG, "Resuming pending enroll request for: ${req.label}")
+        showEnrollDialog(req.label, req.alg, req.deviceName, req.onResult)
+    }
+
+    private fun showEnrollDialog(label: String, alg: String, deviceName: String?, onResult: (Boolean) -> Unit) {
+        val message = buildString {
+            append("Allow generating a new $alg key?\n\nLabel: $label")
+            if (deviceName != null) append("\nRequested by: $deviceName")
+        }
+        android.app.AlertDialog.Builder(activity)
+            .setTitle("New SSH Key Request")
+            .setMessage(message)
+            .setPositiveButton("Allow") { _, _ -> onResult(true) }
+            .setNegativeButton("Deny") { _, _ -> onResult(false) }
+            .setOnCancelListener { onResult(false) }
+            .show()
     }
 
     private fun showBiometricPrompt(alias: String, keyLabel: String, deviceName: String?, data: ByteArray, onResult: (ByteArray?) -> Unit) {
@@ -52,12 +83,10 @@ class BiometricAgentCallback(
                     return
                 }
 
-            // Determine signing algorithm from the public key's X.509 OID.
-            // NONEwithECDSA for P-256: the proxy pre-hashes data to SHA-256 before
-            // sending, so we always sign raw (no re-hashing on Android).
-            val pubEncoded = keyStore.getCertificate(alias)?.publicKey?.encoded
-            val sigAlgo = when {
-                pubEncoded != null && SshWireFormat.isP256PublicKey(pubEncoded) -> "NONEwithECDSA"
+            // NONEwithECDSA for P-256: the SK handler pre-hashes the FIDO2 input
+            // to SHA-256 before sending, so we sign the raw 32-byte hash here.
+            val sigAlgo = when (privateKey.algorithm) {
+                "EC" -> "NONEwithECDSA"
                 else -> "Ed25519"
             }
             Log.d(TAG, "Signing with $sigAlgo for alias $alias")

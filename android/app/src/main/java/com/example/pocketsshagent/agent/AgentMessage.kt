@@ -1,147 +1,106 @@
 package com.example.pocketsshagent.agent
 
-/**
- * SSH agent protocol constants and message types.
- * Reference: draft-miller-ssh-agent (OpenSSH agent protocol).
- */
 object AgentMessageType {
-    // Requests (client -> agent)
-    const val SSH_AGENTC_REQUEST_IDENTITIES: Byte = 11
-    const val SSH_AGENTC_SIGN_REQUEST: Byte = 13
-
-    // Custom: session authentication (proxy -> phone)
-    const val POCKET_AUTH_REQUEST: Byte = 100
-
-    // Responses (agent -> client)
     const val SSH_AGENT_FAILURE: Byte = 5
-    const val SSH_AGENT_IDENTITIES_ANSWER: Byte = 12
-    const val SSH_AGENT_SIGN_RESPONSE: Byte = 14
 
-    // Custom: session authentication responses (phone -> proxy)
-    const val POCKET_AUTH_SUCCESS: Byte = 101
-    const val POCKET_AUTH_FAILURE: Byte = 102
+    // Session authentication (proxy <-> phone)
+    const val POCKET_AUTH_REQUEST: Byte  = 100
+    const val POCKET_AUTH_SUCCESS: Byte  = 101
+    const val POCKET_AUTH_FAILURE: Byte  = 102
+
+    // SK (FIDO2-style security key) operations (proxy <-> phone)
+    const val SK_ENROLL_REQUEST: Byte  = 103
+    const val SK_ENROLL_RESPONSE: Byte = 104
+    const val SK_SIGN_REQUEST: Byte    = 105
+    const val SK_SIGN_RESPONSE: Byte   = 106
 }
 
-/** Flags for sign request. */
-object AgentSignFlags {
-    const val SSH_AGENT_RSA_SHA2_256: Int = 2
-    const val SSH_AGENT_RSA_SHA2_512: Int = 4
-}
-
-/** Parsed sign request from the client. */
-data class SignRequest(
-    val keyBlob: ByteArray,
-    val data: ByteArray,
-    val flags: Int
+/**
+ * Parsed SK_ENROLL_REQUEST from the proxy.
+ * Format: byte type | byte alg | bytes app_hash[32] | byte flags | uint16 label_len | bytes label
+ */
+data class SkEnrollRequest(
+    val alg: Int,
+    val appHash: ByteArray,
+    val flags: Byte,
+    val label: String = ""
 )
 
 /**
- * Parsed auth request from the proxy.
- * Format: byte type | string publicKey (X.509) | string nonce | string signature | string x25519EphemeralKey
+ * Parsed SK_SIGN_REQUEST from the proxy.
+ * Format: byte type | uint16 handle_len | bytes handle | bytes app_hash[32] | byte flags | bytes data_hash[32]
+ */
+data class SkSignRequest(
+    val handle: String,
+    val appHash: ByteArray,
+    val flags: Byte,
+    val dataHash: ByteArray
+)
+
+/**
+ * Parsed POCKET_AUTH_REQUEST from the proxy.
+ * Format: byte type | string publicKey | string nonce | string signature | string x25519EphemeralKey
  */
 data class AuthRequest(
     val publicKey: ByteArray,
     val nonce: ByteArray,
     val signature: ByteArray,
-    val x25519EphemeralKey: ByteArray  // proxy's raw 32-byte X25519 ephemeral public key
+    val x25519EphemeralKey: ByteArray
 )
 
-/** Parse a raw agent message (after length prefix is removed). */
 object AgentMessageParser {
 
-    /**
-     * Parse the message type byte from a raw agent message.
-     */
     fun messageType(message: ByteArray): Byte {
         require(message.isNotEmpty()) { "Empty agent message" }
         return message[0]
     }
 
-    /**
-     * Parse a SIGN_REQUEST message body (after the type byte).
-     * Format: byte type | string key_blob | string data | uint32 flags
-     */
-    fun parseSignRequest(message: ByteArray): SignRequest {
-        require(message[0] == AgentMessageType.SSH_AGENTC_SIGN_REQUEST) {
-            "Not a sign request"
-        }
-        var offset = 1
-        val (keyBlob, nextOffset1) = SshWireFormat.decodeString(message, offset)
-        offset = nextOffset1
-        val (data, nextOffset2) = SshWireFormat.decodeString(message, offset)
-        offset = nextOffset2
-        val flags = if (offset + 4 <= message.size) {
-            SshWireFormat.decodeUint32(message, offset)
-        } else {
-            0
-        }
-        return SignRequest(keyBlob, data, flags)
+    fun parseSkEnrollRequest(message: ByteArray): SkEnrollRequest {
+        require(message[0] == AgentMessageType.SK_ENROLL_REQUEST) { "Not an SK enroll request" }
+        require(message.size >= 35) { "SK enroll request too short: ${message.size}" }
+        val alg = message[1].toInt() and 0xFF
+        val appHash = message.copyOfRange(2, 34)
+        val flags = message[34]
+        val label = if (message.size >= 37) {
+            val labelLen = ((message[35].toInt() and 0xFF) shl 8) or (message[36].toInt() and 0xFF)
+            if (labelLen > 0 && message.size >= 37 + labelLen)
+                String(message, 37, labelLen, Charsets.UTF_8)
+            else ""
+        } else ""
+        return SkEnrollRequest(alg, appHash, flags, label)
     }
 
-    /**
-     * Parse a POCKET_AUTH_REQUEST message.
-     * Format: byte type | string publicKey | string nonce | string signature | string x25519EphemeralKey
-     */
+    fun parseSkSignRequest(message: ByteArray): SkSignRequest {
+        require(message[0] == AgentMessageType.SK_SIGN_REQUEST) { "Not an SK sign request" }
+        require(message.size >= 1 + 2) { "SK sign request too short" }
+        val handleLen = ((message[1].toInt() and 0xFF) shl 8) or (message[2].toInt() and 0xFF)
+        val minSize = 1 + 2 + handleLen + 32 + 1 + 32
+        require(message.size >= minSize) { "SK sign request too short: ${message.size} < $minSize" }
+        var offset = 3
+        val handle = String(message, offset, handleLen, Charsets.UTF_8); offset += handleLen
+        val appHash = message.copyOfRange(offset, offset + 32); offset += 32
+        val flags = message[offset]; offset++
+        val dataHash = message.copyOfRange(offset, offset + 32)
+        return SkSignRequest(handle, appHash, flags, dataHash)
+    }
+
     fun parseAuthRequest(message: ByteArray): AuthRequest {
-        require(message[0] == AgentMessageType.POCKET_AUTH_REQUEST) {
-            "Not an auth request"
-        }
+        require(message[0] == AgentMessageType.POCKET_AUTH_REQUEST) { "Not an auth request" }
         var offset = 1
         val (publicKey, off1) = SshWireFormat.decodeString(message, offset); offset = off1
-        val (nonce, off2) = SshWireFormat.decodeString(message, offset); offset = off2
+        val (nonce,     off2) = SshWireFormat.decodeString(message, offset); offset = off2
         val (signature, off3) = SshWireFormat.decodeString(message, offset); offset = off3
-        val (x25519Key, _) = SshWireFormat.decodeString(message, offset)
+        val (x25519Key, _)    = SshWireFormat.decodeString(message, offset)
         return AuthRequest(publicKey, nonce, signature, x25519Key)
     }
 }
 
-/** Build agent response messages. */
 object AgentMessageBuilder {
 
-    /** Build SSH_AGENT_FAILURE response. */
     fun failure(): ByteArray = byteArrayOf(AgentMessageType.SSH_AGENT_FAILURE)
 
-    /**
-     * Build SSH_AGENT_IDENTITIES_ANSWER response.
-     * Format: byte type | uint32 nkeys | (string key_blob | string comment)*
-     */
-    fun identitiesAnswer(keys: List<Pair<ByteArray, String>>): ByteArray {
-        val body = mutableListOf<Byte>()
-        body.add(AgentMessageType.SSH_AGENT_IDENTITIES_ANSWER)
-        body.addAll(SshWireFormat.encodeUint32(keys.size).toList())
-        for ((keyBlob, comment) in keys) {
-            body.addAll(SshWireFormat.encodeString(keyBlob).toList())
-            body.addAll(SshWireFormat.encodeString(comment).toList())
-        }
-        return body.toByteArray()
-    }
-
-    /**
-     * Build SSH_AGENT_SIGN_RESPONSE for Ed25519.
-     */
-    fun signResponseEd25519(signature: ByteArray): ByteArray {
-        val encodedSig = SshWireFormat.encodeEd25519Signature(signature)
-        return byteArrayOf(AgentMessageType.SSH_AGENT_SIGN_RESPONSE) +
-               SshWireFormat.encodeString(encodedSig)
-    }
-
-    /**
-     * Build SSH_AGENT_SIGN_RESPONSE for ECDSA P-256.
-     * signature: raw DER bytes from Android's NONEwithECDSA.
-     */
-    fun signResponseEcdsaP256(signature: ByteArray): ByteArray {
-        val encodedSig = SshWireFormat.encodeEcdsaP256SignatureFromDer(signature)
-        return byteArrayOf(AgentMessageType.SSH_AGENT_SIGN_RESPONSE) +
-               SshWireFormat.encodeString(encodedSig)
-    }
-
-    /**
-     * Build POCKET_AUTH_SUCCESS response carrying the phone's ephemeral X25519 public key.
-     * Format: byte(101) | string(phoneX25519EphemeralPub)
-     */
     fun authSuccess(phoneEphemeralPub: ByteArray): ByteArray =
         byteArrayOf(AgentMessageType.POCKET_AUTH_SUCCESS) + SshWireFormat.encodeString(phoneEphemeralPub)
 
-    /** Build POCKET_AUTH_FAILURE response. */
     fun authFailure(): ByteArray = byteArrayOf(AgentMessageType.POCKET_AUTH_FAILURE)
 }

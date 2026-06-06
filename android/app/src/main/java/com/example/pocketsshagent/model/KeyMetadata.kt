@@ -5,5 +5,6 @@ data class KeyMetadata(
     val label: String,
     val createdAtEpochMs: Long,
     val lastUsedAtEpochMs: Long?,
-    val hardwareBacked: Boolean
+    val hardwareBacked: Boolean,
+    val skCounter: Long = 0
 )

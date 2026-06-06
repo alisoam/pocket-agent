@@ -49,12 +49,17 @@ class BleAgentService : Service() {
         private const val TAG = "BleAgentService"
         private const val NOTIFICATION_CHANNEL_ID = "ssh_agent_channel"
         private const val SIGN_CHANNEL_ID = "ssh_sign_requests"
+        private const val ENROLL_CHANNEL_ID = "ssh_enroll_requests"
         private const val NOTIFICATION_ID = 1
         private const val SIGN_NOTIFICATION_ID = 2
+        private const val ENROLL_NOTIFICATION_ID = 3
         private const val DEFAULT_MTU = 20
         const val ACTION_SIGN_REQUEST = "com.example.pocketsshagent.ACTION_SIGN_REQUEST"
         const val ACTION_CANCEL_SIGN = "com.example.pocketsshagent.ACTION_CANCEL_SIGN"
+        const val ACTION_ENROLL_REQUEST = "com.example.pocketsshagent.ACTION_ENROLL_REQUEST"
+        const val ACTION_CANCEL_ENROLL = "com.example.pocketsshagent.ACTION_CANCEL_ENROLL"
         private const val SIGN_REQUEST_TIMEOUT_MS = 30_000L
+        private const val ENROLL_REQUEST_TIMEOUT_MS = 60_000L
     }
 
     data class PendingSignRequest(
@@ -65,14 +70,22 @@ class BleAgentService : Service() {
         val onResult: (ByteArray?) -> Unit
     )
 
+    data class PendingEnrollRequest(
+        val label: String,
+        val alg: String,
+        val deviceName: String?,
+        val onResult: (Boolean) -> Unit
+    )
+
     private lateinit var bluetoothManager: BluetoothManager
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private lateinit var trustStore: TrustStore
     private lateinit var keyManager: KeyManager
 
-    // One lock shared across all per-device handlers — only one biometric at a time.
+    // Shared locks — only one signing or enroll dialog at a time across all devices.
     private val signingInProgress = AtomicBoolean(false)
+    private val enrollInProgress = AtomicBoolean(false)
     // Which device addr currently holds the signing lock (null when idle).
     @Volatile private var signingDeviceAddr: String? = null
 
@@ -92,6 +105,8 @@ class BleAgentService : Service() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val signTimeoutRunnable = Runnable { cancelPendingSignRequest() }
+    @Volatile private var pendingEnrollRequest: PendingEnrollRequest? = null
+    private val enrollTimeoutRunnable = Runnable { cancelPendingEnrollRequest() }
 
     inner class LocalBinder : Binder() {
         fun getService(): BleAgentService = this@BleAgentService
@@ -128,6 +143,60 @@ class BleAgentService : Service() {
             Log.d(TAG, "Pending sign request cancelled")
             req.onResult(null)
         }
+    }
+
+    fun setPendingEnrollRequest(request: PendingEnrollRequest) {
+        pendingEnrollRequest = request
+        mainHandler.removeCallbacks(enrollTimeoutRunnable)
+        mainHandler.postDelayed(enrollTimeoutRunnable, ENROLL_REQUEST_TIMEOUT_MS)
+    }
+
+    fun consumePendingEnrollRequest(): PendingEnrollRequest? {
+        mainHandler.removeCallbacks(enrollTimeoutRunnable)
+        val req = pendingEnrollRequest
+        pendingEnrollRequest = null
+        if (req != null) {
+            getSystemService(NotificationManager::class.java).cancel(ENROLL_NOTIFICATION_ID)
+        }
+        return req
+    }
+
+    private fun cancelPendingEnrollRequest() {
+        mainHandler.removeCallbacks(enrollTimeoutRunnable)
+        val req = pendingEnrollRequest
+        pendingEnrollRequest = null
+        getSystemService(NotificationManager::class.java).cancel(ENROLL_NOTIFICATION_ID)
+        if (req != null) {
+            Log.d(TAG, "Pending enroll request cancelled")
+            req.onResult(false)
+        }
+    }
+
+    fun postEnrollNotification(label: String, deviceName: String?) {
+        val tapIntent = Intent(this, MainActivity::class.java).apply {
+            action = ACTION_ENROLL_REQUEST
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val tapPi = PendingIntent.getActivity(
+            this, 1, tapIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val cancelPi = PendingIntent.getService(
+            this, 1,
+            Intent(this, BleAgentService::class.java).apply { action = ACTION_CANCEL_ENROLL },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val contentText = if (deviceName != null) "$deviceName wants to create key: $label" else "Tap to review new SSH key: $label"
+        val notification = Notification.Builder(this, ENROLL_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setContentTitle("New SSH Key Request")
+            .setContentText(contentText)
+            .setContentIntent(tapPi)
+            .setDeleteIntent(cancelPi)
+            .setAutoCancel(true)
+            .setPriority(Notification.PRIORITY_HIGH)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(ENROLL_NOTIFICATION_ID, notification)
     }
 
     fun postSignNotification(keyLabel: String, deviceName: String?) {
@@ -198,6 +267,7 @@ class BleAgentService : Service() {
         deviceMtu.clear()
         deviceHandlers.clear()
         cancelPendingSignRequest()
+        cancelPendingEnrollRequest()
     }
 
     private fun restartBleStack() {
@@ -221,12 +291,25 @@ class BleAgentService : Service() {
                     onResult(null)
                 }
             }
-        }, trustStore, signingInProgress)
+            override fun requestEnrollConfirmation(label: String, alg: String, deviceName: String?, onResult: (Boolean) -> Unit) {
+                val cb = agentCallback
+                if (cb != null) {
+                    cb.requestEnrollConfirmation(label, alg, deviceName, onResult)
+                } else {
+                    Log.w(TAG, "No AgentCallback set, denying enroll request")
+                    onResult(false)
+                }
+            }
+        }, trustStore, signingInProgress, enrollInProgress)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_CANCEL_SIGN) {
             cancelPendingSignRequest()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_CANCEL_ENROLL) {
+            cancelPendingEnrollRequest()
             return START_NOT_STICKY
         }
         startGattServer()
@@ -472,6 +555,13 @@ class BleAgentService : Service() {
                 "SSH Sign Requests",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply { description = "Tap to approve SSH signing requests" }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(
+                ENROLL_CHANNEL_ID,
+                "SSH Key Creation Requests",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply { description = "Tap to approve or deny new SSH key creation" }
         )
     }
 

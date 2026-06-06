@@ -120,7 +120,7 @@ func (cm *ConnectionManager) SendMessage(msg []byte) ([]byte, error) {
 	if !cm.IsConnected() {
 		// Sign requests need extra time: BLE reconnect + app foreground + biometric.
 		waitTimeout := 15 * time.Second
-		if len(msg) > 0 && msg[0] == 13 { // SSH_AGENTC_SIGN_REQUEST
+		if len(msg) > 0 && (msg[0] == 13 || msg[0] == 105) { // SIGN_REQUEST or SK_SIGN_REQUEST
 			waitTimeout = 45 * time.Second
 		}
 		log.Printf("BLE not connected (%s), waiting up to %v for reconnection...", cm.GetState(), waitTimeout)

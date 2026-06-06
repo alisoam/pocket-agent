@@ -6,19 +6,22 @@ import com.example.pocketsshagent.crypto.KeyManager
 import com.example.pocketsshagent.crypto.SessionCrypto
 import com.example.pocketsshagent.pairing.TrustStore
 import java.security.KeyFactory
+import java.security.MessageDigest
 import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
 import java.util.concurrent.atomic.AtomicBoolean
 
 interface AgentCallback {
     fun requestBiometricSign(alias: String, keyLabel: String, deviceName: String?, data: ByteArray, onResult: (ByteArray?) -> Unit)
+    fun requestEnrollConfirmation(label: String, alg: String, deviceName: String?, onResult: (Boolean) -> Unit)
 }
 
 class SshAgentHandler(
     private val keyManager: KeyManager,
     private val callback: AgentCallback,
     private val trustStore: TrustStore? = null,
-    private val signingInProgress: AtomicBoolean = AtomicBoolean(false)
+    private val signingInProgress: AtomicBoolean = AtomicBoolean(false),
+    private val enrollInProgress: AtomicBoolean = AtomicBoolean(false)
 ) {
     companion object {
         private const val TAG = "SshAgentHandler"
@@ -32,6 +35,7 @@ class SshAgentHandler(
         authenticated = false
         authenticatedDeviceKey = null
         sessionCrypto = null
+        enrollInProgress.set(false)
     }
 
     fun handleMessage(message: ByteArray, onResponse: (ByteArray) -> Unit) {
@@ -40,13 +44,11 @@ class SshAgentHandler(
             return
         }
 
-        // Auth message always arrives in plaintext — it establishes the session key
         if (AgentMessageParser.messageType(message) == AgentMessageType.POCKET_AUTH_REQUEST) {
             handleAuthRequest(message, onResponse)
             return
         }
 
-        // Decrypt incoming message when a session key is active
         val crypto = sessionCrypto
         val plaintext: ByteArray = if (crypto != null) {
             try {
@@ -65,8 +67,6 @@ class SshAgentHandler(
             return
         }
 
-        // Wrap onResponse to encrypt outgoing responses when a session is active.
-        // Incoming framed = [4B len][raw]; strip len, encrypt raw, re-frame.
         val respond: (ByteArray) -> Unit = if (crypto != null) { framed ->
             val raw = framed.copyOfRange(4, framed.size)
             val encrypted = try {
@@ -81,13 +81,13 @@ class SshAgentHandler(
         }
 
         when (AgentMessageParser.messageType(plaintext)) {
-            AgentMessageType.SSH_AGENTC_REQUEST_IDENTITIES -> {
+            AgentMessageType.SK_ENROLL_REQUEST -> {
                 if (!requireAuth(respond)) return
-                respond(SshWireFormat.frameMessage(handleRequestIdentities()))
+                handleSkEnroll(plaintext, respond)
             }
-            AgentMessageType.SSH_AGENTC_SIGN_REQUEST -> {
+            AgentMessageType.SK_SIGN_REQUEST -> {
                 if (!requireAuth(respond)) return
-                handleSignRequest(plaintext, respond)
+                handleSkSign(plaintext, respond)
             }
             else -> respond(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
         }
@@ -103,12 +103,9 @@ class SshAgentHandler(
     }
 
     private fun handleAuthRequest(message: ByteArray, onResponse: (ByteArray) -> Unit) {
-        // BLE notification retransmissions can deliver the same auth request multiple times.
-        // Each call generates a fresh X25519 keypair, which would overwrite the session key
-        // already established with the proxy, causing a key mismatch on the next request.
         if (authenticated) {
-            Log.w(TAG, "Ignoring duplicate auth request; session already established")
-            return
+            Log.i(TAG, "Auth request while session active — resetting for new connection")
+            resetSession()
         }
 
         val authRequest = try {
@@ -125,8 +122,6 @@ class SshAgentHandler(
             val publicKey = keyFactory.generatePublic(keySpec)
             val sig = Signature.getInstance("Ed25519")
             sig.initVerify(publicKey)
-            // Signature covers nonce || x25519EphemeralKey, binding the ephemeral key
-            // to the Ed25519 identity to prevent MITM substitution.
             sig.update(authRequest.nonce + authRequest.x25519EphemeralKey)
             sig.verify(authRequest.signature)
         } catch (e: Exception) {
@@ -147,7 +142,6 @@ class SshAgentHandler(
             return
         }
 
-        // ECDH key exchange: derive per-session AES-256-GCM key
         val (crypto, ourPubRaw) = try {
             SessionCrypto.establish(authRequest.x25519EphemeralKey, authRequest.nonce)
         } catch (e: Exception) {
@@ -162,107 +156,204 @@ class SshAgentHandler(
         trustStore?.updateLastSeen(publicKeyBase64)
         Log.i(TAG, "Session authenticated and encrypted (AES-256-GCM) for device: ${publicKeyBase64.take(8)}…")
 
-        // 101 response carries phone's ephemeral X25519 pubkey (plaintext — session starts after this)
         onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authSuccess(ourPubRaw)))
     }
 
-    private fun handleRequestIdentities(): ByteArray {
-        val keys = keyManager.listKeys()
-        val keyPairs = keys.mapNotNull { metadata ->
-            try {
-                val publicKey = keyManager.getPublicKey(metadata.alias)
-                val encoded = publicKey.encoded
-                val keyBlob = when {
-                    SshWireFormat.isEd25519PublicKey(encoded) -> {
-                        Log.d(TAG, "Key '${metadata.label}': Ed25519")
-                        SshWireFormat.encodeEd25519PublicKey(
-                            SshWireFormat.extractRawEd25519PublicKey(encoded)
-                        )
-                    }
-                    SshWireFormat.isP256PublicKey(encoded) -> {
-                        Log.d(TAG, "Key '${metadata.label}': ECDSA P-256")
-                        SshWireFormat.encodeEcdsaP256PublicKey(
-                            SshWireFormat.extractRawP256PublicKey(encoded)
-                        )
-                    }
-                    else -> {
-                        Log.w(TAG, "Key '${metadata.label}': unknown type (encodedLen=${encoded.size}), skipping")
-                        return@mapNotNull null
-                    }
-                }
-                keyBlob to metadata.label
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to load key '${metadata.label}': $e")
-                null
-            }
-        }
-        return AgentMessageBuilder.identitiesAnswer(keyPairs)
-    }
-
-    private fun handleSignRequest(message: ByteArray, onResponse: (ByteArray) -> Unit) {
-        if (!signingInProgress.compareAndSet(false, true)) {
-            Log.w(TAG, "Sign request rejected: signing already in progress")
+    /**
+     * SK_ENROLL_REQUEST: generate a new key and return its public key + alias as handle.
+     *
+     * After generation, the actual key algorithm is verified against the request.
+     * If there is a mismatch (device silently fell back to ECDSA when Ed25519 was
+     * requested), the key is deleted and a failure is returned — the user must
+     * use ssh-keygen -t ecdsa-sk instead.
+     *
+     * Request:  [type:1=103][alg:1][app_hash:32][flags:1][label_len:2][label:N]
+     * Response: [type:1=104][actual_alg:1][pubkey_len:2][pubkey:N][handle_len:2][handle:N]
+     */
+    private fun handleSkEnroll(message: ByteArray, onResponse: (ByteArray) -> Unit) {
+        if (!enrollInProgress.compareAndSet(false, true)) {
+            Log.w(TAG, "SK enroll: rejected — enroll already in progress")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
         }
 
-        val signRequest = try {
-            AgentMessageParser.parseSignRequest(message)
-        } catch (_: Exception) {
-            signingInProgress.set(false)
+        val req = try {
+            AgentMessageParser.parseSkEnrollRequest(message)
+        } catch (e: Exception) {
+            enrollInProgress.set(false)
+            Log.e(TAG, "SK enroll: parse failed: $e")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
         }
 
-        val (alias, isP256) = findKeyAlias(signRequest.keyBlob) ?: run {
-            signingInProgress.set(false)
+        val isEcdsa = req.alg == 0
+        if (req.alg != 0 && req.alg != 1) {
+            enrollInProgress.set(false)
+            Log.w(TAG, "SK enroll: unsupported algorithm ${req.alg}")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
         }
 
-        val keyLabel = keyManager.listKeys().find { it.alias == alias }?.label ?: alias
+        val defaultLabel = if (isEcdsa) "Security Key (ecdsa-sk)" else "Security Key (ed25519-sk)"
+        val label = req.label.ifEmpty { defaultLabel }
+        val algName = if (isEcdsa) "ecdsa-sk" else "ed25519-sk"
         val deviceName = authenticatedDeviceKey?.let { trustStore?.getDevice(it)?.label }
 
-        callback.requestBiometricSign(alias, keyLabel, deviceName, signRequest.data) { signature ->
-            signingInProgress.set(false)
-            if (signature != null) {
-                keyManager.updateLastUsed(alias)
-                val response = if (isP256) {
-                    AgentMessageBuilder.signResponseEcdsaP256(signature)
-                } else {
-                    AgentMessageBuilder.signResponseEd25519(signature)
-                }
-                onResponse(SshWireFormat.frameMessage(response))
-            } else {
+        callback.requestEnrollConfirmation(label, algName, deviceName) { accepted ->
+            enrollInProgress.set(false)
+            if (!accepted) {
+                Log.i(TAG, "SK enroll: user rejected key creation for '$label'")
                 onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+                return@requestEnrollConfirmation
             }
+            doEnroll(req, label, isEcdsa, onResponse)
         }
     }
 
-    /** Returns (alias, isP256) for the key matching the requested blob, or null. */
-    private fun findKeyAlias(requestedKeyBlob: ByteArray): Pair<String, Boolean>? {
-        for (metadata in keyManager.listKeys()) {
-            try {
-                val publicKey = keyManager.getPublicKey(metadata.alias)
-                val encoded = publicKey.encoded
-                val keyBlob = when {
-                    SshWireFormat.isEd25519PublicKey(encoded) ->
-                        SshWireFormat.encodeEd25519PublicKey(
-                            SshWireFormat.extractRawEd25519PublicKey(encoded)
-                        )
-                    SshWireFormat.isP256PublicKey(encoded) ->
-                        SshWireFormat.encodeEcdsaP256PublicKey(
-                            SshWireFormat.extractRawP256PublicKey(encoded)
-                        )
-                    else -> continue
-                }
-                if (keyBlob.contentEquals(requestedKeyBlob)) {
-                    return metadata.alias to SshWireFormat.isP256PublicKey(encoded)
-                }
-            } catch (_: Exception) {
-                continue
-            }
+    private fun doEnroll(req: SkEnrollRequest, label: String, isEcdsa: Boolean, onResponse: (ByteArray) -> Unit) {
+        val metadata = try {
+            keyManager.generateKey(label, isEcdsa)
+        } catch (e: Exception) {
+            Log.e(TAG, "SK enroll: key generation failed: $e")
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            return
         }
-        return null
+
+        // Verify the device actually generated the requested algorithm.
+        val actualAlgorithm = keyManager.getKeyAlgorithm(metadata.alias)
+        val actualAlg = when (actualAlgorithm) {
+            "EC" -> 0
+            else -> 1  // Ed25519 / EdDSA
+        }
+
+        if (actualAlg != req.alg) {
+            Log.w(TAG, "SK enroll: alg mismatch — requested ${req.alg} but device generated $actualAlg ($actualAlgorithm). Deleting key.")
+            keyManager.deleteKey(metadata.alias)
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            return
+        }
+
+        val rawPubKey = try {
+            val encoded = keyManager.getPublicKey(metadata.alias).encoded
+            if (isEcdsa) SshWireFormat.extractRawP256PublicKey(encoded)
+            else SshWireFormat.extractRawEd25519PublicKey(encoded)
+        } catch (e: Exception) {
+            Log.e(TAG, "SK enroll: failed to extract public key: $e")
+            keyManager.deleteKey(metadata.alias)
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            return
+        }
+
+        // Response: [type:1][actual_alg:1][pubkey_len:2][pubkey:N][handle_len:2][handle:N]
+        val handleBytes = metadata.alias.toByteArray(Charsets.UTF_8)
+        val response = ByteArray(1 + 1 + 2 + rawPubKey.size + 2 + handleBytes.size)
+        var off = 0
+        response[off++] = AgentMessageType.SK_ENROLL_RESPONSE
+        response[off++] = actualAlg.toByte()
+        response[off++] = (rawPubKey.size shr 8).toByte()
+        response[off++] = (rawPubKey.size and 0xFF).toByte()
+        System.arraycopy(rawPubKey, 0, response, off, rawPubKey.size); off += rawPubKey.size
+        response[off++] = (handleBytes.size shr 8).toByte()
+        response[off++] = (handleBytes.size and 0xFF).toByte()
+        System.arraycopy(handleBytes, 0, response, off, handleBytes.size)
+
+        Log.i(TAG, "SK enroll succeeded: alg=$actualAlg alias=${metadata.alias}")
+        onResponse(SshWireFormat.frameMessage(response))
+    }
+
+    /**
+     * SK_SIGN_REQUEST: sign the FIDO2 input for the key identified by handle.
+     *
+     * The proxy sends pre-hashed components; we embed the counter and sign:
+     *   FIDO2 input = app_hash[32] || flags[1] || counter_BE32[4] || data_hash[32] (69 bytes)
+     *
+     * For Ed25519: sign the 69 bytes directly.
+     * For ECDSA P-256: sign SHA-256(69 bytes) via NONEwithECDSA.
+     *
+     * Request:  [type:1=105][handle_len:2][handle:N][app_hash:32][flags:1][data_hash:32]
+     * Response: [type:1=106][sig:64][counter:4][flags:1]
+     *   Ed25519: sig[0:64] = full signature
+     *   ECDSA:   sig[0:32] = R, sig[32:64] = S
+     */
+    private fun handleSkSign(message: ByteArray, onResponse: (ByteArray) -> Unit) {
+        if (!signingInProgress.compareAndSet(false, true)) {
+            Log.w(TAG, "SK sign: rejected — signing already in progress")
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            return
+        }
+
+        val req = try {
+            AgentMessageParser.parseSkSignRequest(message)
+        } catch (e: Exception) {
+            signingInProgress.set(false)
+            Log.e(TAG, "SK sign: parse failed: $e")
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            return
+        }
+
+        if (keyManager.listKeys().none { it.alias == req.handle }) {
+            signingInProgress.set(false)
+            Log.w(TAG, "SK sign: unknown key handle: ${req.handle}")
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            return
+        }
+
+        val counter = keyManager.incrementSkCounter(req.handle)
+
+        // FIDO2 signing input: app_hash || flags || counter_BE32 || data_hash (69 bytes)
+        val signingInput = ByteArray(69)
+        System.arraycopy(req.appHash, 0, signingInput, 0, 32)
+        signingInput[32] = req.flags
+        signingInput[33] = (counter shr 24).toByte()
+        signingInput[34] = (counter shr 16).toByte()
+        signingInput[35] = (counter shr 8).toByte()
+        signingInput[36] = counter.toByte()
+        System.arraycopy(req.dataHash, 0, signingInput, 37, 32)
+
+        val isEcdsa = keyManager.getKeyAlgorithm(req.handle) == "EC"
+        val dataToSign = if (isEcdsa) {
+            MessageDigest.getInstance("SHA-256").digest(signingInput)
+        } else {
+            signingInput
+        }
+
+        val keyLabel = keyManager.listKeys().find { it.alias == req.handle }?.label ?: req.handle
+        val deviceName = authenticatedDeviceKey?.let { trustStore?.getDevice(it)?.label }
+
+        callback.requestBiometricSign(req.handle, keyLabel, deviceName, dataToSign) { signature ->
+            signingInProgress.set(false)
+            if (signature == null) {
+                onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+                return@requestBiometricSign
+            }
+
+            keyManager.updateLastUsed(req.handle)
+
+            val sigBlock = ByteArray(64)
+            if (isEcdsa) {
+                val (r, s) = try {
+                    SshWireFormat.extractRawEcdsaComponents(signature)
+                } catch (e: Exception) {
+                    Log.e(TAG, "SK sign: failed to parse ECDSA signature: $e")
+                    onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+                    return@requestBiometricSign
+                }
+                System.arraycopy(r, 0, sigBlock, 0, 32)
+                System.arraycopy(s, 0, sigBlock, 32, 32)
+            } else {
+                System.arraycopy(signature, 0, sigBlock, 0, minOf(64, signature.size))
+            }
+
+            // SK_SIGN_RESPONSE: [type:1][sig:64][counter:4][flags:1]
+            val response = ByteArray(70)
+            response[0] = AgentMessageType.SK_SIGN_RESPONSE
+            System.arraycopy(sigBlock, 0, response, 1, 64)
+            response[65] = (counter shr 24).toByte()
+            response[66] = (counter shr 16).toByte()
+            response[67] = (counter shr 8).toByte()
+            response[68] = counter.toByte()
+            response[69] = (req.flags.toInt() or 0x01).toByte()
+            onResponse(SshWireFormat.frameMessage(response))
+        }
     }
 }

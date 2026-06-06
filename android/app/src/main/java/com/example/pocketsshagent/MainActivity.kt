@@ -29,11 +29,15 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -118,6 +122,7 @@ class MainActivity : FragmentActivity() {
     override fun onResume() {
         super.onResume()
         biometricCallback?.resumePendingSign()
+        biometricCallback?.resumePendingEnroll()
     }
 
     override fun onDestroy() {
@@ -147,8 +152,10 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
     var keys by remember { mutableStateOf(emptyList<KeyMetadata>()) }
     var showDialog by remember { mutableStateOf(false) }
     var labelInput by remember { mutableStateOf("") }
+    var selectedAlg by remember { mutableStateOf("ed25519") }
 
-    LaunchedEffect(Unit) {
+    val keysVersion by KeyManager.keysVersion.collectAsState()
+    LaunchedEffect(keysVersion) {
         keys = keyManager.listKeys()
     }
 
@@ -192,7 +199,8 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
                             onDelete = {
                                 keyManager.deleteKey(key.alias)
                                 keys = keyManager.listKeys()
-                            }
+                            },
+                            onRenamed = { keys = keyManager.listKeys() }
                         )
                         HorizontalDivider()
                     }
@@ -202,6 +210,7 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
     }
 
     if (showDialog) {
+        val algorithms = listOf("ed25519", "ecdsa")
         AlertDialog(
             onDismissRequest = { showDialog = false },
             confirmButton = {
@@ -209,9 +218,10 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
                     onClick = {
                         val label = labelInput.trim()
                         if (label.isNotEmpty()) {
-                            keyManager.generateKey(label)
+                            keyManager.generateKey(label, isEcdsa = selectedAlg == "ecdsa")
                             keys = keyManager.listKeys()
                             labelInput = ""
+                            selectedAlg = "ed25519"
                             showDialog = false
                         }
                     }
@@ -226,7 +236,7 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
             },
             title = { Text(text = "Create SSH key") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(text = "Choose a label. It cannot be changed later.")
                     TextField(
                         value = labelInput,
@@ -234,6 +244,17 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
                         singleLine = true,
                         placeholder = { Text(text = "e.g. Laptop") }
                     )
+                    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                        algorithms.forEachIndexed { index, alg ->
+                            SegmentedButton(
+                                selected = selectedAlg == alg,
+                                onClick = { selectedAlg = alg },
+                                shape = SegmentedButtonDefaults.itemShape(index, algorithms.size)
+                            ) {
+                                Text(text = alg)
+                            }
+                        }
+                    }
                 }
             }
         )
@@ -241,22 +262,23 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
 }
 
 @Composable
-private fun KeyRow(key: KeyMetadata, keyManager: KeyManager, onDelete: () -> Unit) {
+private fun KeyRow(key: KeyMetadata, keyManager: KeyManager, onDelete: () -> Unit, onRenamed: () -> Unit = {}) {
     val context = LocalContext.current
     var showPublicKey by remember { mutableStateOf(false) }
     var publicKeyLine by remember { mutableStateOf("") }
     var fingerprint by remember { mutableStateOf("") }
+    var showHandle by remember { mutableStateOf(false) }
+    var keyFileContent by remember { mutableStateOf("") }
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var renameInput by remember { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxWidth()) {
         val keyType = remember(key.alias) {
-            try {
-                val enc = keyManager.getPublicKey(key.alias).encoded
-                when {
-                    com.example.pocketsshagent.agent.SshWireFormat.isEd25519PublicKey(enc) -> "Ed25519"
-                    com.example.pocketsshagent.agent.SshWireFormat.isP256PublicKey(enc) -> "ECDSA P-256"
-                    else -> keyManager.getKeyAlgorithm(key.alias) ?: "Unknown"
-                }
-            } catch (_: Exception) { "Unknown" }
+            when (keyManager.getKeyAlgorithm(key.alias)) {
+                "EC"               -> "ecdsa-sk"
+                "Ed25519", "EdDSA" -> "ed25519-sk"
+                else               -> "Unknown"
+            }
         }
         Text(text = key.label, style = MaterialTheme.typography.titleMedium)
         Spacer(modifier = Modifier.height(4.dp))
@@ -272,6 +294,7 @@ private fun KeyRow(key: KeyMetadata, keyManager: KeyManager, onDelete: () -> Uni
                     publicKeyLine = SshPublicKeyUtils.formatAuthorizedKeysLine(pubKey, key.label)
                     fingerprint = SshPublicKeyUtils.fingerprint(pubKey)
                     showPublicKey = true
+                    showHandle = false
                 } catch (e: Exception) {
                     android.util.Log.e("KeyRow", "Failed to read public key", e)
                     Toast.makeText(context, "Failed to read public key: ${e.message}", Toast.LENGTH_LONG).show()
@@ -279,9 +302,61 @@ private fun KeyRow(key: KeyMetadata, keyManager: KeyManager, onDelete: () -> Uni
             }) {
                 Text(text = "Public Key")
             }
+            TextButton(onClick = {
+                if (!showHandle) {
+                    try {
+                        val pubKey = keyManager.getPublicKey(key.alias)
+                        keyFileContent = SshPublicKeyUtils.formatOpenSshPrivateKeyFile(pubKey, key.alias, key.label)
+                        showHandle = true
+                        showPublicKey = false
+                    } catch (e: Exception) {
+                        android.util.Log.e("KeyRow", "Failed to build key file", e)
+                        Toast.makeText(context, "Failed to build key file: ${e.message}", Toast.LENGTH_LONG).show()
+                    }
+                } else {
+                    showHandle = false
+                }
+            }) {
+                Text(text = "Key File")
+            }
+            TextButton(onClick = {
+                renameInput = key.label
+                showRenameDialog = true
+            }) {
+                Text(text = "Rename")
+            }
             TextButton(onClick = onDelete) {
                 Text(text = "Delete")
             }
+        }
+
+        if (showRenameDialog) {
+            AlertDialog(
+                onDismissRequest = { showRenameDialog = false },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val newLabel = renameInput.trim()
+                            if (newLabel.isNotEmpty()) {
+                                keyManager.renameKey(key.alias, newLabel)
+                                showRenameDialog = false
+                                onRenamed()
+                            }
+                        }
+                    ) { Text(text = "Rename") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showRenameDialog = false }) { Text(text = "Cancel") }
+                },
+                title = { Text(text = "Rename key") },
+                text = {
+                    TextField(
+                        value = renameInput,
+                        onValueChange = { renameInput = it },
+                        singleLine = true
+                    )
+                }
+            )
         }
 
         if (showPublicKey) {
@@ -304,6 +379,22 @@ private fun KeyRow(key: KeyMetadata, keyManager: KeyManager, onDelete: () -> Uni
                 val clipboard = context.getSystemService(ClipboardManager::class.java)
                 clipboard.setPrimaryClip(ClipData.newPlainText("SSH Public Key", publicKeyLine))
                 Toast.makeText(context, "Public key copied", Toast.LENGTH_SHORT).show()
+            }) {
+                Text(text = "Copy to Clipboard")
+            }
+        }
+
+        if (showHandle) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = keyFileContent,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace
+            )
+            TextButton(onClick = {
+                val clipboard = context.getSystemService(ClipboardManager::class.java)
+                clipboard.setPrimaryClip(ClipData.newPlainText("SSH SK Private Key File", keyFileContent))
+                Toast.makeText(context, "Key file copied", Toast.LENGTH_SHORT).show()
             }) {
                 Text(text = "Copy to Clipboard")
             }
