@@ -331,6 +331,10 @@ class BleAgentService : Service() {
             Log.e(TAG, "Missing Bluetooth permissions")
             return
         }
+        if (gattServer != null) {
+            Log.d(TAG, "GATT server already running, skipping")
+            return
+        }
 
         gattServer = bluetoothManager.openGattServer(this, gattCallback)
         val service = BluetoothGattService(
