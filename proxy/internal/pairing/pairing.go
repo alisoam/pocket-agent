@@ -5,22 +5,61 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/skip2/go-qrcode"
 )
 
+// PairingVersion is the current pairing payload version.
+const PairingVersion = 2
+
+// PairingTTL is how long a generated QR code remains valid.
+const PairingTTL = 5 * time.Minute
+
+// signatureDomain is the domain-separation prefix bound into the pairing
+// signature transcript. Changing it breaks compatibility with older clients
+// and is intentional whenever the transcript layout changes.
+const signatureDomain = "pocket-pair-v2\x00"
+
 // PairingPayload is the JSON structure encoded in the QR code.
+//
+// The signature is computed over a domain-separated transcript:
+//
+//	signatureDomain || uint64(issuedAtMs) || uint64(expiresAtMs)
+//	  || nonce || x509PubKey || utf8(label)
+//
+// This binds the signature to the validity window, the device key, and the
+// label — preventing reuse of an older signature with edited fields.
 type PairingPayload struct {
-	Version   int    `json:"version"`
-	PublicKey string `json:"publicKey"` // Base64 X.509 encoded Ed25519 public key
-	Nonce     string `json:"nonce"`     // Base64 random 32 bytes
-	Label     string `json:"label"`
-	Signature string `json:"signature"` // Base64 Ed25519 signature of nonce
+	Version      int    `json:"version"`
+	PublicKey    string `json:"publicKey"`    // Base64 X.509 encoded Ed25519 public key
+	Nonce        string `json:"nonce"`        // Base64 random 32 bytes
+	Label        string `json:"label"`
+	IssuedAtMs   int64  `json:"issuedAtMs"`   // Unix epoch milliseconds when QR was generated
+	ExpiresAtMs  int64  `json:"expiresAtMs"`  // Unix epoch milliseconds when QR stops being valid
+	Signature    string `json:"signature"`    // Base64 Ed25519 signature over the transcript above
+}
+
+// SignatureTranscript builds the byte sequence that the pairing signature
+// covers. Exported so the verifier (Android) and any tests can rebuild it
+// identically.
+func SignatureTranscript(issuedAtMs, expiresAtMs int64, nonce, x509PubKey []byte, label string) []byte {
+	var buf []byte
+	buf = append(buf, []byte(signatureDomain)...)
+	var times [16]byte
+	binary.BigEndian.PutUint64(times[0:8], uint64(issuedAtMs))
+	binary.BigEndian.PutUint64(times[8:16], uint64(expiresAtMs))
+	buf = append(buf, times[:]...)
+	buf = append(buf, nonce...)
+	buf = append(buf, x509PubKey...)
+	buf = append(buf, []byte(label)...)
+	return buf
 }
 
 // DeviceKeys holds the proxy's Ed25519 keypair.
@@ -79,21 +118,27 @@ func GenerateQR(keys *DeviceKeys, label string, outputPath string) error {
 		return fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	// Sign the nonce
-	signature := ed25519.Sign(keys.PrivateKey, nonce)
-
 	// Encode public key in X.509/PKIX format
 	x509PubKey, err := x509.MarshalPKIXPublicKey(keys.PublicKey)
 	if err != nil {
 		return fmt.Errorf("failed to marshal public key: %w", err)
 	}
 
+	now := time.Now()
+	issuedAtMs := now.UnixMilli()
+	expiresAtMs := now.Add(PairingTTL).UnixMilli()
+
+	transcript := SignatureTranscript(issuedAtMs, expiresAtMs, nonce, x509PubKey, label)
+	signature := ed25519.Sign(keys.PrivateKey, transcript)
+
 	payload := PairingPayload{
-		Version:   1,
-		PublicKey: base64.RawStdEncoding.EncodeToString(x509PubKey),
-		Nonce:     base64.RawStdEncoding.EncodeToString(nonce),
-		Label:     label,
-		Signature: base64.RawStdEncoding.EncodeToString(signature),
+		Version:     PairingVersion,
+		PublicKey:   base64.RawStdEncoding.EncodeToString(x509PubKey),
+		Nonce:       base64.RawStdEncoding.EncodeToString(nonce),
+		Label:       label,
+		IssuedAtMs:  issuedAtMs,
+		ExpiresAtMs: expiresAtMs,
+		Signature:   base64.RawStdEncoding.EncodeToString(signature),
 	}
 
 	jsonBytes, err := json.Marshal(payload)

@@ -40,6 +40,7 @@ import java.util.Locale
 fun PairingScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val trustStore = remember { TrustStore(context) }
+    val seenNonces = remember { SeenNonceCache(context) }
     var devices by remember { mutableStateOf(trustStore.getAllDevices()) }
     var scanning by remember { mutableStateOf(false) }
     var hasCameraPermission by remember {
@@ -64,12 +65,14 @@ fun PairingScreen(onBack: () -> Unit) {
             Box(modifier = Modifier.weight(1f)) {
                 QrScannerView(
                     onQrScanned = { qrContent ->
-                        val device = PairingProtocol.completePairing(qrContent, trustStore)
-                        if (device != null) {
-                            Toast.makeText(context, "Paired with: ${device.label}", Toast.LENGTH_SHORT).show()
-                            devices = trustStore.getAllDevices()
-                        } else {
-                            Toast.makeText(context, "Pairing failed — invalid QR code", Toast.LENGTH_SHORT).show()
+                        when (val result = PairingProtocol.completePairing(qrContent, trustStore, seenNonces)) {
+                            is PairingProtocol.Result.Success -> {
+                                Toast.makeText(context, "Paired with: ${result.device.label}", Toast.LENGTH_SHORT).show()
+                                devices = trustStore.getAllDevices()
+                            }
+                            is PairingProtocol.Result.Failure -> {
+                                Toast.makeText(context, "Pairing failed: ${result.reason}", Toast.LENGTH_LONG).show()
+                            }
                         }
                         scanning = false
                     }
