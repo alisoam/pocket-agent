@@ -26,7 +26,10 @@ Authentication works the same way: the provider sends the signing input to the p
 PocketKey/
 ├── android/   Android app (Kotlin/Compose) — key management, BLE GATT server, biometric signing
 └── proxy/     Linux desktop proxy (Go + C) — BLE client, OpenSSH SK provider
-    ├── cmd/pocket-agent/   CLI for pairing and diagnostics
+    ├── cmd/pocket-agent/   CLI for pairing, diagnostics, and attestation verification
+    ├── internal/
+    │   ├── ble/            BLE GATT client with auto-reconnect and encrypted transport
+    │   └── pairing/        Ed25519 device key management and QR code generation
     └── sk/                 libpocket-sk.so — OpenSSH SecurityKeyProvider shared library
 ```
 
@@ -180,6 +183,33 @@ ssh user@internal   # still prompts on your phone
 ```bash
 # ~/.bashrc or ~/.zshrc
 ssh-add -S /path/to/libpocket-sk.so ~/.ssh/id_ed25519_sk 2>/dev/null
+```
+
+### Hardware attestation
+
+ECDSA keys support Android hardware attestation, which cryptographically proves the key lives in the phone's TEE or StrongBox — not in software. The attestation certificate chain is anchored to Google's published hardware attestation roots.
+
+```bash
+# Generate an ECDSA key with attestation:
+ssh-keygen -t ecdsa-sk -w ./sk/libpocket-sk.so -O write-attestation=key.attest
+
+# Verify the attestation chain:
+./pocket-agent verify-attestation key.attest
+# Attestation chain (4 certs):
+#   [0] subject: ...
+# Chain signature linkage: OK
+# Chain anchors to Google hardware attestation root: OK
+#
+# Key Description:
+#   KeyMint security level:     StrongBox
+#
+# → Key is hardware-backed in StrongBox (highest assurance).
+```
+
+To verify the challenge matches what ssh-keygen sent:
+
+```bash
+./pocket-agent verify-attestation --challenge <hex> key.attest
 ```
 
 ### Diagnostics

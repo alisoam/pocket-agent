@@ -19,26 +19,41 @@ import java.time.Instant
 class KeyManager(private val context: Context) {
     private val store = KeyMetadataStore(context)
 
-    fun generateKey(label: String): KeyMetadata = generateKey(label, isEcdsa = false)
+    fun generateKey(label: String): KeyMetadata = generateKey(label, isEcdsa = false, attestationChallenge = null)
 
-    fun generateKey(label: String, isEcdsa: Boolean): KeyMetadata {
+    fun generateKey(label: String, isEcdsa: Boolean): KeyMetadata =
+        generateKey(label, isEcdsa, attestationChallenge = null)
+
+    /**
+     * Generate a new signing key.
+     *
+     * If [attestationChallenge] is non-null AND [isEcdsa] is true, the key is generated with
+     * a hardware attestation challenge — the resulting cert chain (retrievable via
+     * [getAttestationChain]) is rooted in Google's hardware attestation root and lets
+     * relying parties verify the key actually lives in StrongBox/TEE.
+     *
+     * Android Keystore does not support attestation for Ed25519 keys, so the challenge is
+     * silently ignored when [isEcdsa] is false.
+     */
+    fun generateKey(label: String, isEcdsa: Boolean, attestationChallenge: ByteArray?): KeyMetadata {
         val alias = if (isEcdsa) "ec_${Instant.now().toEpochMilli()}"
                     else "ssh_ed25519_${Instant.now().toEpochMilli()}"
 
         val generator: KeyPairGenerator
         if (isEcdsa) {
+            val builder = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA256)
+                .setUserAuthenticationRequired(true)
+                .setUserAuthenticationParameters(
+                    0,
+                    KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL
+                )
+            if (attestationChallenge != null && attestationChallenge.isNotEmpty()) {
+                builder.setAttestationChallenge(attestationChallenge)
+            }
             generator = KeyPairGenerator.getInstance("EC", ANDROID_KEY_STORE)
-            generator.initialize(
-                KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
-                    .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
-                    .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA256)
-                    .setUserAuthenticationRequired(true)
-                    .setUserAuthenticationParameters(
-                        0,
-                        KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL
-                    )
-                    .build()
-            )
+            generator.initialize(builder.build())
         } else {
             generator = KeyPairGenerator.getInstance(ALGORITHM_ED25519, ANDROID_KEY_STORE)
             generator.initialize(
@@ -109,6 +124,19 @@ class KeyManager(private val context: Context) {
         val newCounter = current.skCounter + 1
         store.put(current.copy(skCounter = newCounter))
         return newCounter
+    }
+
+    /**
+     * Returns the DER-encoded X.509 certificate chain for [alias], leaf-first.
+     * For keys generated with an attestation challenge this is the hardware attestation
+     * chain rooted in Google's attestation root; for non-attested keys it is a single
+     * self-signed cert and not useful for proving hardware backing.
+     */
+    fun getAttestationChain(alias: String): List<ByteArray> {
+        val keyStore = KeyStore.getInstance(ANDROID_KEY_STORE)
+        keyStore.load(null)
+        val chain = keyStore.getCertificateChain(alias) ?: return emptyList()
+        return chain.map { it.encoded }
     }
 
     fun getKeyAlgorithm(alias: String): String? {

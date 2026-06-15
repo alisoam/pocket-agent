@@ -167,8 +167,13 @@ class SshAgentHandler(
      * requested), the key is deleted and a failure is returned — the user must
      * use ssh-keygen -t ecdsa-sk instead.
      *
-     * Request:  [type:1=103][alg:1][app_hash:32][flags:1][label_len:2][label:N]
+     * Request:  [type:1=103][alg:1][app_hash:32][flags:1][label_len:2][label:N][chal_len:2][challenge:N]
      * Response: [type:1=104][actual_alg:1][pubkey_len:2][pubkey:N][handle_len:2][handle:N]
+     *           [cert_count:1] {[cert_len:2][cert:N]}*
+     *
+     * The challenge enables Android Keystore hardware attestation: when present and non-empty
+     * and the algorithm is ECDSA (alg=0), the returned cert_count is the length of the
+     * hardware attestation chain (leaf-first). For Ed25519 or absent challenge, cert_count=0.
      */
     private fun handleSkEnroll(message: ByteArray, onResponse: (ByteArray) -> Unit) {
         if (!enrollInProgress.compareAndSet(false, true)) {
@@ -211,8 +216,10 @@ class SshAgentHandler(
     }
 
     private fun doEnroll(req: SkEnrollRequest, label: String, isEcdsa: Boolean, onResponse: (ByteArray) -> Unit) {
+        // Attestation is only available for EC keys on Android Keystore.
+        val challenge = if (isEcdsa && req.attestationChallenge.isNotEmpty()) req.attestationChallenge else null
         val metadata = try {
-            keyManager.generateKey(label, isEcdsa)
+            keyManager.generateKey(label, isEcdsa, challenge)
         } catch (e: Exception) {
             Log.e(TAG, "SK enroll: key generation failed: $e")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
@@ -244,9 +251,28 @@ class SshAgentHandler(
             return
         }
 
+        // Collect the attestation chain when a challenge was supplied. For non-EC keys or
+        // when the device does not support attestation, this returns the (useless) single
+        // self-signed cert — we suppress that case to keep cert_count truthful.
+        val attestationChain: List<ByteArray> = if (challenge != null) {
+            try {
+                keyManager.getAttestationChain(metadata.alias)
+            } catch (e: Exception) {
+                Log.w(TAG, "SK enroll: failed to fetch attestation chain: $e")
+                emptyList()
+            }
+        } else emptyList()
+
+        if (attestationChain.size > 255) {
+            Log.w(TAG, "SK enroll: attestation chain longer than 255 certs, truncating")
+        }
+        val chain = attestationChain.take(255)
+        val chainBytes = chain.sumOf { 2 + it.size }
+
         // Response: [type:1][actual_alg:1][pubkey_len:2][pubkey:N][handle_len:2][handle:N]
+        //           [cert_count:1] {[cert_len:2][cert:N]}*
         val handleBytes = metadata.alias.toByteArray(Charsets.UTF_8)
-        val response = ByteArray(1 + 1 + 2 + rawPubKey.size + 2 + handleBytes.size)
+        val response = ByteArray(1 + 1 + 2 + rawPubKey.size + 2 + handleBytes.size + 1 + chainBytes)
         var off = 0
         response[off++] = AgentMessageType.SK_ENROLL_RESPONSE
         response[off++] = actualAlg.toByte()
@@ -255,9 +281,15 @@ class SshAgentHandler(
         System.arraycopy(rawPubKey, 0, response, off, rawPubKey.size); off += rawPubKey.size
         response[off++] = (handleBytes.size shr 8).toByte()
         response[off++] = (handleBytes.size and 0xFF).toByte()
-        System.arraycopy(handleBytes, 0, response, off, handleBytes.size)
+        System.arraycopy(handleBytes, 0, response, off, handleBytes.size); off += handleBytes.size
+        response[off++] = chain.size.toByte()
+        for (cert in chain) {
+            response[off++] = (cert.size shr 8).toByte()
+            response[off++] = (cert.size and 0xFF).toByte()
+            System.arraycopy(cert, 0, response, off, cert.size); off += cert.size
+        }
 
-        Log.i(TAG, "SK enroll succeeded: alg=$actualAlg alias=${metadata.alias}")
+        Log.i(TAG, "SK enroll succeeded: alg=$actualAlg alias=${metadata.alias} attestationCerts=${chain.size}")
         onResponse(SshWireFormat.frameMessage(response))
     }
 

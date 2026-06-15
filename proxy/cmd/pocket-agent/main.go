@@ -22,6 +22,8 @@ func main() {
 		cmdPair(os.Args[2:])
 	case "test":
 		cmdTest(os.Args[2:])
+	case "verify-attestation":
+		cmdVerifyAttestation(os.Args[2:])
 	case "help":
 		printUsage()
 	default:
@@ -35,13 +37,15 @@ func printUsage() {
 	fmt.Println(`pocket-agent - PocketSSH SK provider companion
 
 Usage:
-  pocket-agent pair   Generate pairing QR code for the phone app
-  pocket-agent test   Connect to phone and verify BLE + authentication
-  pocket-agent help   Show this help message
+  pocket-agent pair                Generate pairing QR code for the phone app
+  pocket-agent test                Connect to phone and verify BLE + authentication
+  pocket-agent verify-attestation  Verify a hardware-attestation file written by ssh-keygen
+  pocket-agent help                Show this help message
 
 After pairing, use the SK provider directly:
   ssh-keygen -t ed25519-sk -w /path/to/libpocket-sk.so
-  ssh-keygen -t ecdsa-sk   -w /path/to/libpocket-sk.so`)
+  ssh-keygen -t ecdsa-sk   -w /path/to/libpocket-sk.so -O write-attestation=key.attest
+  pocket-agent verify-attestation key.attest`)
 }
 
 func cmdTest(args []string) {

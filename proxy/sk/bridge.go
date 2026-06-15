@@ -57,6 +57,7 @@ struct sk_option {
 import "C"
 import (
 	"crypto/ed25519"
+	"encoding/binary"
 	"log"
 	"os"
 	"path/filepath"
@@ -111,13 +112,11 @@ func sk_enroll(
 	options **C.struct_sk_option,
 	enrollResponse **C.struct_sk_enroll_response,
 ) C.int {
-	// Suppress unused-parameter warnings; we don't use challenge, pin, or options.
-	_ = challenge
-	_ = challengeLen
+	// Suppress unused-parameter warnings; we don't use pin or options.
 	_ = pin
 	_ = options
 
-	log.Printf("[SK] sk_enroll: alg=%d flags=0x%02x", alg, flags)
+	log.Printf("[SK] sk_enroll: alg=%d flags=0x%02x challenge_len=%d", alg, flags, challengeLen)
 
 	if uint32(alg) != 0 && uint32(alg) != 1 { // SSH_SK_ECDSA or SSH_SK_ED25519
 		log.Printf("[SK] sk_enroll: unsupported algorithm %d", alg)
@@ -131,7 +130,11 @@ func sk_enroll(
 
 	app := C.GoString(application)
 	label := optionValue(options, "label")
-	pubkey, keyHandle, actualAlg, err := backend.Enroll(app, uint32(alg), byte(flags), label)
+	var challengeBytes []byte
+	if challenge != nil && challengeLen > 0 {
+		challengeBytes = C.GoBytes(unsafe.Pointer(challenge), C.int(challengeLen))
+	}
+	pubkey, keyHandle, actualAlg, attestationChain, err := backend.Enroll(app, uint32(alg), byte(flags), label, challengeBytes)
 	if err != nil {
 		log.Printf("[SK] sk_enroll: %v", err)
 		if uint32(alg) == 1 {
@@ -169,7 +172,12 @@ func sk_enroll(
 	resp.key_handle_len = C.size_t(len(keyHandle))
 	C.memcpy(unsafe.Pointer(resp.key_handle), unsafe.Pointer(&keyHandle[0]), C.size_t(len(keyHandle)))
 
-	// No attestation certificate — not required for SSH user authentication.
+	// Attestation (optional). When the phone returns a hardware attestation chain
+	// (only when challenge was supplied and the key is ECDSA), the leaf cert goes
+	// into attestation_cert and any intermediates are packed into authdata as:
+	//   [count:1] {[len_be:2][cert:N]}*
+	// This lets the user recover the full chain via ssh-keygen -O write-attestation=...
+	// and verify the key truly lives in StrongBox/TEE on a Play-certified device.
 	resp.signature = nil
 	resp.signature_len = 0
 	resp.attestation_cert = nil
@@ -177,8 +185,48 @@ func sk_enroll(
 	resp.authdata = nil
 	resp.authdata_len = 0
 
+	if len(attestationChain) > 0 {
+		leaf := attestationChain[0]
+		resp.attestation_cert = (*C.uint8_t)(C.malloc(C.size_t(len(leaf))))
+		if resp.attestation_cert == nil {
+			C.free(unsafe.Pointer(resp.key_handle))
+			C.free(unsafe.Pointer(resp.public_key))
+			C.free(unsafe.Pointer(resp))
+			return C.int(C.SSH_SK_ERR_GENERAL)
+		}
+		resp.attestation_cert_len = C.size_t(len(leaf))
+		C.memcpy(unsafe.Pointer(resp.attestation_cert), unsafe.Pointer(&leaf[0]), C.size_t(len(leaf)))
+
+		if len(attestationChain) > 1 {
+			intermediates := attestationChain[1:]
+			authSize := 1
+			for _, c := range intermediates {
+				authSize += 2 + len(c)
+			}
+			authBuf := make([]byte, authSize)
+			authBuf[0] = byte(len(intermediates))
+			aOff := 1
+			for _, c := range intermediates {
+				binary.BigEndian.PutUint16(authBuf[aOff:], uint16(len(c)))
+				aOff += 2
+				copy(authBuf[aOff:], c)
+				aOff += len(c)
+			}
+			resp.authdata = (*C.uint8_t)(C.malloc(C.size_t(len(authBuf))))
+			if resp.authdata == nil {
+				C.free(unsafe.Pointer(resp.attestation_cert))
+				C.free(unsafe.Pointer(resp.key_handle))
+				C.free(unsafe.Pointer(resp.public_key))
+				C.free(unsafe.Pointer(resp))
+				return C.int(C.SSH_SK_ERR_GENERAL)
+			}
+			resp.authdata_len = C.size_t(len(authBuf))
+			C.memcpy(unsafe.Pointer(resp.authdata), unsafe.Pointer(&authBuf[0]), C.size_t(len(authBuf)))
+		}
+	}
+
 	*enrollResponse = resp
-	log.Printf("[SK] sk_enroll: success, handle=%q", string(keyHandle))
+	log.Printf("[SK] sk_enroll: success, handle=%q attestation_certs=%d", string(keyHandle), len(attestationChain))
 	return C.int(0)
 }
 

@@ -23,7 +23,8 @@ data class SkEnrollRequest(
     val alg: Int,
     val appHash: ByteArray,
     val flags: Byte,
-    val label: String = ""
+    val label: String = "",
+    val attestationChallenge: ByteArray = ByteArray(0)
 )
 
 /**
@@ -61,13 +62,28 @@ object AgentMessageParser {
         val alg = message[1].toInt() and 0xFF
         val appHash = message.copyOfRange(2, 34)
         val flags = message[34]
-        val label = if (message.size >= 37) {
-            val labelLen = ((message[35].toInt() and 0xFF) shl 8) or (message[36].toInt() and 0xFF)
-            if (labelLen > 0 && message.size >= 37 + labelLen)
-                String(message, 37, labelLen, Charsets.UTF_8)
-            else ""
-        } else ""
-        return SkEnrollRequest(alg, appHash, flags, label)
+        var label = ""
+        var off = 35
+        if (message.size >= off + 2) {
+            val labelLen = ((message[off].toInt() and 0xFF) shl 8) or (message[off + 1].toInt() and 0xFF)
+            off += 2
+            if (labelLen > 0 && message.size >= off + labelLen) {
+                label = String(message, off, labelLen, Charsets.UTF_8)
+                off += labelLen
+            } else if (labelLen > 0) {
+                // Truncated label — bail, treat rest as absent.
+                return SkEnrollRequest(alg, appHash, flags, label)
+            }
+        }
+        var challenge = ByteArray(0)
+        if (message.size >= off + 2) {
+            val chLen = ((message[off].toInt() and 0xFF) shl 8) or (message[off + 1].toInt() and 0xFF)
+            off += 2
+            if (chLen > 0 && message.size >= off + chLen) {
+                challenge = message.copyOfRange(off, off + chLen)
+            }
+        }
+        return SkEnrollRequest(alg, appHash, flags, label, challenge)
     }
 
     fun parseSkSignRequest(message: ByteArray): SkSignRequest {

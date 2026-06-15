@@ -82,17 +82,22 @@ func (b *SKBackend) ensureConnected() error {
 //
 // Message to phone — SK_ENROLL_REQUEST (103):
 //
-//	[type:1=103][alg:1][app_hash:32][flags:1][label_len:2][label:N]
+//	[type:1=103][alg:1][app_hash:32][flags:1][label_len:2][label:N][chal_len:2][challenge:N]
 //
 // Response from phone — SK_ENROLL_RESPONSE (104):
 //
 //	[type:1=104][actual_alg:1][pubkey_len:2][pubkey:N][handle_len:2][handle:N]
+//	[cert_count:1] {[cert_len:2][cert:N]}*
 //
 // actual_alg may differ from alg on devices where Android Keystore silently
 // falls back to ECDSA when Ed25519 is unavailable. In that case the phone
 // deletes the key and returns failure (type 5) instead, so callers only see
 // actual_alg in successful responses — but it is always verified here.
-func (b *SKBackend) Enroll(application string, alg uint32, flags byte, label string) (pubkey, keyHandle []byte, actualAlg uint32, err error) {
+//
+// When challenge is non-empty and alg is ECDSA, the phone returns the hardware
+// attestation cert chain (leaf-first, rooted in Google's attestation root).
+// For Ed25519 or empty challenge, attestationChain is empty.
+func (b *SKBackend) Enroll(application string, alg uint32, flags byte, label string, challenge []byte) (pubkey, keyHandle []byte, actualAlg uint32, attestationChain [][]byte, err error) {
 	if err = b.ensureConnected(); err != nil {
 		return
 	}
@@ -100,29 +105,45 @@ func (b *SKBackend) Enroll(application string, alg uint32, flags byte, label str
 	appHash := sha256.Sum256([]byte(application))
 	labelBytes := []byte(label)
 
-	msg := make([]byte, 1+1+32+1+2+len(labelBytes))
-	msg[0] = msgSKEnrollRequest
-	msg[1] = byte(alg)
-	copy(msg[2:34], appHash[:])
-	msg[34] = flags
-	binary.BigEndian.PutUint16(msg[35:37], uint16(len(labelBytes)))
-	copy(msg[37:], labelBytes)
+	if len(labelBytes) > 0xFFFF {
+		return nil, nil, 0, nil, fmt.Errorf("enroll: label too long (%d bytes)", len(labelBytes))
+	}
+	if len(challenge) > 0xFFFF {
+		return nil, nil, 0, nil, fmt.Errorf("enroll: challenge too long (%d bytes)", len(challenge))
+	}
+
+	msg := make([]byte, 1+1+32+1+2+len(labelBytes)+2+len(challenge))
+	off := 0
+	msg[off] = msgSKEnrollRequest
+	off++
+	msg[off] = byte(alg)
+	off++
+	copy(msg[off:], appHash[:])
+	off += 32
+	msg[off] = flags
+	off++
+	binary.BigEndian.PutUint16(msg[off:], uint16(len(labelBytes)))
+	off += 2
+	copy(msg[off:], labelBytes)
+	off += len(labelBytes)
+	binary.BigEndian.PutUint16(msg[off:], uint16(len(challenge)))
+	off += 2
+	copy(msg[off:], challenge)
 
 	resp, err := b.connMgr.SendMessage(msg)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("enroll: BLE send failed: %w", err)
+		return nil, nil, 0, nil, fmt.Errorf("enroll: BLE send failed: %w", err)
 	}
 
 	if len(resp) < 1 || resp[0] == msgFailure {
-		return nil, nil, 0, fmt.Errorf("enroll: rejected by phone (device may not support requested algorithm)")
+		return nil, nil, 0, nil, fmt.Errorf("enroll: rejected by phone (device may not support requested algorithm)")
 	}
 	if resp[0] != msgSKEnrollResponse {
-		return nil, nil, 0, fmt.Errorf("enroll: unexpected response type %d", resp[0])
+		return nil, nil, 0, nil, fmt.Errorf("enroll: unexpected response type %d", resp[0])
 	}
 
-	// [type:1][actual_alg:1][pubkey_len:2][pubkey:N][handle_len:2][handle:N]
 	if len(resp) < 1+1+2 {
-		return nil, nil, 0, fmt.Errorf("enroll: response too short (%d bytes)", len(resp))
+		return nil, nil, 0, nil, fmt.Errorf("enroll: response too short (%d bytes)", len(resp))
 	}
 	actualAlg = uint32(resp[1])
 	if actualAlg != alg {
@@ -131,23 +152,45 @@ func (b *SKBackend) Enroll(application string, alg uint32, flags byte, label str
 
 	pubkeyLen := int(binary.BigEndian.Uint16(resp[2:4]))
 	if len(resp) < 1+1+2+pubkeyLen+2 {
-		return nil, nil, 0, fmt.Errorf("enroll: response truncated at pubkey")
+		return nil, nil, 0, nil, fmt.Errorf("enroll: response truncated at pubkey")
 	}
 	pubkey = make([]byte, pubkeyLen)
 	copy(pubkey, resp[4:4+pubkeyLen])
 
-	off := 4 + pubkeyLen
-	handleLen := int(binary.BigEndian.Uint16(resp[off : off+2]))
-	off += 2
-	if len(resp) < off+handleLen {
-		return nil, nil, 0, fmt.Errorf("enroll: response truncated at handle")
+	rOff := 4 + pubkeyLen
+	handleLen := int(binary.BigEndian.Uint16(resp[rOff : rOff+2]))
+	rOff += 2
+	if len(resp) < rOff+handleLen {
+		return nil, nil, 0, nil, fmt.Errorf("enroll: response truncated at handle")
 	}
 	keyHandle = make([]byte, handleLen)
-	copy(keyHandle, resp[off:off+handleLen])
+	copy(keyHandle, resp[rOff:rOff+handleLen])
+	rOff += handleLen
 
-	log.Printf("[SK] Enroll succeeded: requested_alg=%d actual_alg=%d handle=%q pubkey=%x…",
-		alg, actualAlg, string(keyHandle), pubkey[:4])
-	return pubkey, keyHandle, actualAlg, nil
+	// Optional attestation chain (older phones may omit).
+	if rOff < len(resp) {
+		certCount := int(resp[rOff])
+		rOff++
+		attestationChain = make([][]byte, 0, certCount)
+		for i := 0; i < certCount; i++ {
+			if len(resp) < rOff+2 {
+				return nil, nil, 0, nil, fmt.Errorf("enroll: response truncated at cert %d length", i)
+			}
+			certLen := int(binary.BigEndian.Uint16(resp[rOff : rOff+2]))
+			rOff += 2
+			if len(resp) < rOff+certLen {
+				return nil, nil, 0, nil, fmt.Errorf("enroll: response truncated at cert %d body", i)
+			}
+			cert := make([]byte, certLen)
+			copy(cert, resp[rOff:rOff+certLen])
+			attestationChain = append(attestationChain, cert)
+			rOff += certLen
+		}
+	}
+
+	log.Printf("[SK] Enroll succeeded: requested_alg=%d actual_alg=%d handle=%q pubkey=%x… attestation_certs=%d",
+		alg, actualAlg, string(keyHandle), pubkey[:4], len(attestationChain))
+	return pubkey, keyHandle, actualAlg, attestationChain, nil
 }
 
 // Sign asks the phone to sign an SSH challenge with the key identified by keyHandle.
