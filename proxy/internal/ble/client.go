@@ -24,6 +24,13 @@ import (
 // Legitimate SSH agent messages (key blobs, signatures) are well under 64 KB.
 const maxBleFrameBytes = 64 * 1024
 
+// ProtocolVersion is the highest session protocol version this proxy speaks.
+// The phone picks min(client, phone) during the auth handshake and the
+// negotiated byte is bound into the HKDF info string, so a downgrade attacker
+// who strips features cannot produce a session key that both peers accept.
+// Bump this only when the wire format, transcript, or KDF changes.
+const ProtocolVersion uint8 = 1
+
 var (
 	ServiceUUID = bluetooth.NewUUID([16]byte{
 		0xa1, 0x1e, 0x1f, 0x4e, 0xc8, 0xa0, 0x4d, 0x3b,
@@ -183,14 +190,20 @@ func (c *Client) Connect() error {
 //
 // Protocol (type 100 request):
 //
-//	byte(100) | string(x509_pubkey) | string(nonce) | string(ed25519_sig) | string(x25519_ephemeral_pub)
+//	byte(100) | string(x509_pubkey) | string(nonce) | string(ed25519_sig) | string(x25519_ephemeral_pub) | byte(client_max_version)
 //
 // ed25519_sig covers nonce || x25519_ephemeral_pub (not the nonce alone), binding
 // the ephemeral key to the Ed25519 identity and preventing MITM key substitution.
+// The trailing client_max_version byte is optional for backward compatibility —
+// pre-versioning phones simply ignore the extra byte and the peer defaults to v1.
 //
 // Protocol (type 101 success response):
 //
-//	byte(101) | string(x25519_ephemeral_pub_phone)
+//	byte(101) | string(x25519_ephemeral_pub_phone) | byte(negotiated_version)
+//
+// negotiated_version is min(client_max_version, phone_max_version). It is bound
+// into the HKDF info so any future cipher-suite change cannot be downgraded:
+// the derived session key changes whenever the version byte does.
 //
 // After this call all messages sent via SendMessage are encrypted with
 // AES-256-GCM using a key derived from the ECDH shared secret.
@@ -220,12 +233,13 @@ func (c *Client) Authenticate(privateKey ed25519.PrivateKey) error {
 	signedData := append(nonce, ephemPub...)
 	signature := ed25519.Sign(privateKey, signedData)
 
-	// Build auth message: byte(100) | string(pubkey) | string(nonce) | string(sig) | string(x25519_pub)
+	// Build auth message: byte(100) | string(pubkey) | string(nonce) | string(sig) | string(x25519_pub) | byte(version)
 	msg := []byte{100} // POCKET_AUTH_REQUEST
 	msg = append(msg, encodeString(x509PubKey)...)
 	msg = append(msg, encodeString(nonce)...)
 	msg = append(msg, encodeString(signature)...)
 	msg = append(msg, encodeString(ephemPub)...)
+	msg = append(msg, ProtocolVersion)
 
 	// SendMessage is called before sessionActive=true, so this goes out plaintext.
 	response, err := c.SendMessage(msg)
@@ -251,19 +265,29 @@ func (c *Client) Authenticate(privateKey ed25519.PrivateKey) error {
 			return fmt.Errorf("invalid phone X25519 key: %w", err)
 		}
 
+		// Negotiated version byte trails the X25519 key. Older phones omit it;
+		// in that case both peers fall back to v1.
+		negotiated := uint8(1)
+		if len(response) >= 5+keyLen+1 {
+			negotiated = response[5+keyLen]
+		}
+		if negotiated == 0 || negotiated > ProtocolVersion {
+			return fmt.Errorf("phone selected unsupported protocol version %d (we support up to %d)", negotiated, ProtocolVersion)
+		}
+
 		shared, err := ephemPriv.ECDH(phonePub)
 		if err != nil {
 			return fmt.Errorf("ECDH failed: %w", err)
 		}
 
-		derived := deriveSessionKey(shared, nonce)
+		derived := deriveSessionKey(shared, nonce, negotiated)
 
 		c.mu.Lock()
 		c.sessionKey = derived
 		c.sessionActive = true
 		c.mu.Unlock()
 
-		log.Println("Authentication successful — session key established (AES-256-GCM)")
+		log.Printf("Authentication successful — session key established (AES-256-GCM, protocol v%d)", negotiated)
 		return nil
 
 	case 102: // POCKET_AUTH_FAILURE
@@ -403,8 +427,17 @@ func (c *Client) Disconnect() {
 
 // deriveSessionKey produces a 32-byte AES-256 key from an X25519 shared secret
 // using HKDF-SHA256 (RFC 5869).  The nonce from the auth handshake is the salt
-// so the derived key is bound to this specific session.
-func deriveSessionKey(sharedSecret, salt []byte) [32]byte {
+// so the derived key is bound to this specific session, and the negotiated
+// protocol version is bound into the info string so a downgrade attacker who
+// strips features cannot make a v1 key look like a v2 key — the KDF output
+// changes whenever the version byte does.
+//
+// Info layout (must match SessionCrypto.kt on the phone):
+//
+//	"pocket-ssh-session" || 0x00 || version || 0x01
+//
+// The trailing 0x01 is the single-block HKDF-Expand counter (RFC 5869 §2.3).
+func deriveSessionKey(sharedSecret, salt []byte, version uint8) [32]byte {
 	// HKDF-Extract: PRK = HMAC-SHA256(salt, IKM)
 	prk := hmac.New(sha256.New, salt)
 	prk.Write(sharedSecret)
@@ -412,7 +445,8 @@ func deriveSessionKey(sharedSecret, salt []byte) [32]byte {
 
 	// HKDF-Expand: OKM = HMAC-SHA256(PRK, info || 0x01)  (single 32-byte block)
 	okm := hmac.New(sha256.New, extracted)
-	okm.Write([]byte("pocket-ssh-session-v1\x01"))
+	okm.Write([]byte("pocket-ssh-session\x00"))
+	okm.Write([]byte{version, 0x01})
 	var key [32]byte
 	copy(key[:], okm.Sum(nil))
 	return key

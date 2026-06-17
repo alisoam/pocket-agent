@@ -142,8 +142,18 @@ class SshAgentHandler(
             return
         }
 
+        // Negotiate protocol version: pick the highest we both support. A version
+        // of 0 from the peer is malformed; reject rather than fall through to a
+        // weaker default that could be attacker-chosen.
+        if (authRequest.clientVersion <= 0) {
+            Log.w(TAG, "Auth request: invalid client version ${authRequest.clientVersion}")
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authFailure()))
+            return
+        }
+        val negotiatedVersion = minOf(authRequest.clientVersion, AgentMessageType.PROTOCOL_VERSION)
+
         val (crypto, ourPubRaw) = try {
-            SessionCrypto.establish(authRequest.x25519EphemeralKey, authRequest.nonce)
+            SessionCrypto.establish(authRequest.x25519EphemeralKey, authRequest.nonce, negotiatedVersion)
         } catch (e: Exception) {
             Log.e(TAG, "ECDH key exchange failed", e)
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authFailure()))
@@ -154,9 +164,9 @@ class SshAgentHandler(
         authenticatedDeviceKey = publicKeyBase64
         sessionCrypto = crypto
         trustStore?.updateLastSeen(publicKeyBase64)
-        Log.i(TAG, "Session authenticated and encrypted (AES-256-GCM) for device: ${publicKeyBase64.take(8)}…")
+        Log.i(TAG, "Session authenticated and encrypted (AES-256-GCM, protocol v$negotiatedVersion) for device: ${publicKeyBase64.take(8)}…")
 
-        onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authSuccess(ourPubRaw)))
+        onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.authSuccess(ourPubRaw, negotiatedVersion)))
     }
 
     /**

@@ -13,6 +13,14 @@ object AgentMessageType {
     const val SK_ENROLL_RESPONSE: Byte = 104
     const val SK_SIGN_REQUEST: Byte    = 105
     const val SK_SIGN_RESPONSE: Byte   = 106
+
+    /**
+     * Highest session protocol version this app speaks. Bumped only when the
+     * wire format, transcript, or KDF changes. The phone picks
+     * min(clientVersion, PROTOCOL_VERSION) during auth and binds the negotiated
+     * byte into the HKDF info string for downgrade protection.
+     */
+    const val PROTOCOL_VERSION: Int = 1
 }
 
 /**
@@ -40,13 +48,17 @@ data class SkSignRequest(
 
 /**
  * Parsed POCKET_AUTH_REQUEST from the proxy.
- * Format: byte type | string publicKey | string nonce | string signature | string x25519EphemeralKey
+ * Format: byte type | string publicKey | string nonce | string signature | string x25519EphemeralKey | byte clientVersion?
+ *
+ * The trailing clientVersion byte is optional — older proxies omit it, in which
+ * case we default to protocol version 1.
  */
 data class AuthRequest(
     val publicKey: ByteArray,
     val nonce: ByteArray,
     val signature: ByteArray,
-    val x25519EphemeralKey: ByteArray
+    val x25519EphemeralKey: ByteArray,
+    val clientVersion: Int = 1
 )
 
 object AgentMessageParser {
@@ -106,8 +118,10 @@ object AgentMessageParser {
         val (publicKey, off1) = SshWireFormat.decodeString(message, offset); offset = off1
         val (nonce,     off2) = SshWireFormat.decodeString(message, offset); offset = off2
         val (signature, off3) = SshWireFormat.decodeString(message, offset); offset = off3
-        val (x25519Key, _)    = SshWireFormat.decodeString(message, offset)
-        return AuthRequest(publicKey, nonce, signature, x25519Key)
+        val (x25519Key, off4) = SshWireFormat.decodeString(message, offset); offset = off4
+        // Optional trailing version byte. Pre-versioning proxies omit it.
+        val clientVersion = if (offset < message.size) message[offset].toInt() and 0xFF else 1
+        return AuthRequest(publicKey, nonce, signature, x25519Key, clientVersion)
     }
 }
 
@@ -115,8 +129,18 @@ object AgentMessageBuilder {
 
     fun failure(): ByteArray = byteArrayOf(AgentMessageType.SSH_AGENT_FAILURE)
 
-    fun authSuccess(phoneEphemeralPub: ByteArray): ByteArray =
-        byteArrayOf(AgentMessageType.POCKET_AUTH_SUCCESS) + SshWireFormat.encodeString(phoneEphemeralPub)
+    /**
+     * Build a POCKET_AUTH_SUCCESS response.
+     *   byte(101) | string(phoneEphemeralPub) | byte(negotiatedVersion)
+     *
+     * The trailing version byte is what the phone selected (== min of its own
+     * max and the client's max). The client validates this and binds it into
+     * the HKDF info string — see [SessionCrypto.establish].
+     */
+    fun authSuccess(phoneEphemeralPub: ByteArray, negotiatedVersion: Int): ByteArray =
+        byteArrayOf(AgentMessageType.POCKET_AUTH_SUCCESS) +
+            SshWireFormat.encodeString(phoneEphemeralPub) +
+            byteArrayOf((negotiatedVersion and 0xFF).toByte())
 
     fun authFailure(): ByteArray = byteArrayOf(AgentMessageType.POCKET_AUTH_FAILURE)
 }

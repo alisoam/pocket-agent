@@ -13,8 +13,13 @@ import java.security.spec.X509EncodedKeySpec
 /**
  * Per-session encryption using ephemeral X25519 ECDH + AES-256-GCM.
  *
- * Key derivation: HKDF-SHA256(IKM=X25519SharedSecret, salt=authNonce, info="pocket-ssh-session-v1\x01")
+ * Key derivation: HKDF-SHA256(IKM=X25519SharedSecret, salt=authNonce,
+ *                             info="pocket-ssh-session" || 0x00 || version)
  * Wire format:    [12B nonce][ciphertext][16B GCM auth tag]
+ *
+ * The `version` byte is the negotiated session protocol version from the auth
+ * handshake. Binding it into the KDF means a downgrade attacker who strips
+ * features cannot make two peers agree on the same key for different versions.
  *
  * Must mirror the proxy's deriveSessionKey / sealAESGCM / openAESGCM in ble/client.go.
  */
@@ -36,7 +41,11 @@ class SessionCrypto private constructor(private val key: ByteArray) {
          *   - the ready-to-use [SessionCrypto]
          *   - our raw 32-byte public key to send back in the 101 response
          */
-        fun establish(proxyEphemeralPubRaw: ByteArray, salt: ByteArray): Pair<SessionCrypto, ByteArray> {
+        fun establish(
+            proxyEphemeralPubRaw: ByteArray,
+            salt: ByteArray,
+            negotiatedVersion: Int
+        ): Pair<SessionCrypto, ByteArray> {
             val kpg = KeyPairGenerator.getInstance("X25519")
             val keyPair = kpg.generateKeyPair()
 
@@ -51,16 +60,25 @@ class SessionCrypto private constructor(private val key: ByteArray) {
             ka.doPhase(proxyPub, true)
             val sharedSecret = ka.generateSecret()
 
+            // HKDF info: "pocket-ssh-session" || 0x00 || version
+            // The single-block HKDF-Expand counter (0x01) is appended inside hkdfSha256.
+            val infoPrefix = "pocket-ssh-session".toByteArray(Charsets.US_ASCII)
+            val info = infoPrefix + byteArrayOf(0x00, (negotiatedVersion and 0xFF).toByte())
+
             val sessionKey = hkdfSha256(
                 ikm  = sharedSecret,
                 salt = salt,
-                info = "pocket-ssh-session-v1".toByteArray(Charsets.US_ASCII)
+                info = info
             )
 
             return SessionCrypto(sessionKey) to ourPubRaw
         }
 
-        // HKDF-SHA256 single-block expand (RFC 5869)
+        /**
+         * HKDF-SHA256 single-block extract+expand (RFC 5869).
+         * Expand inputs HMAC(PRK, info || 0x01); the trailing counter byte is
+         * appended here so callers pass only the semantic `info` bytes.
+         */
         private fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
             val mac = Mac.getInstance("HmacSHA256")
             mac.init(SecretKeySpec(salt, "HmacSHA256"))
@@ -69,6 +87,7 @@ class SessionCrypto private constructor(private val key: ByteArray) {
             val mac2 = Mac.getInstance("HmacSHA256")
             mac2.init(SecretKeySpec(prk, "HmacSHA256"))
             mac2.update(info)
+            mac2.update(byteArrayOf(0x01))
             return mac2.doFinal()
         }
     }
