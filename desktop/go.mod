@@ -1,4 +1,4 @@
-module github.com/example/pocket-agent-proxy
+module github.com/example/pocket-agent-desktop
 
 go 1.26.3
 

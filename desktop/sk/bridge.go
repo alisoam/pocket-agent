@@ -63,7 +63,7 @@ import (
 	"path/filepath"
 	"unsafe"
 
-	"github.com/example/pocket-agent-proxy/internal/pairing"
+	"github.com/example/pocket-agent-desktop/internal/pairing"
 )
 
 func loadPrivateKey() (ed25519.PrivateKey, error) {

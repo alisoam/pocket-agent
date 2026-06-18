@@ -8,30 +8,40 @@ The phone implements the OpenSSH SecurityKey (FIDO2-over-BLE) protocol, so `ssh-
 
 ## How it works
 
+**Desktop (BLE)** — use the phone as a wireless hardware key from a Linux desktop:
+
 ```
-ssh-keygen / ssh
+ssh-keygen / ssh (Linux)
       │
       └─ SecurityKeyProvider (libpocket-sk.so)
               │
               └─ BLE ──► Android App ──► Android Keystore (TEE / StrongBox)
 ```
 
-When `ssh-keygen -t ed25519-sk` runs, it contacts the SK provider, which relays the request to the phone over BLE. The phone prompts for biometric confirmation, generates the key in Keystore, and returns only the public key and a key handle. The private key never crosses BLE.
+**Termux (on-device)** — use the phone's keys directly from Termux, no BLE needed:
 
-Authentication works the same way: the provider sends the signing input to the phone, the phone shows a biometric prompt, signs inside Keystore, and returns only the signature.
+```
+ssh-keygen / ssh (Termux)
+      │
+      └─ SecurityKeyProvider (libpocket-sk.so)
+              │
+              └─ Broadcast IPC ──► Android App ──► Android Keystore (TEE / StrongBox)
+```
+
+In both modes, `ssh-keygen` and `ssh` talk to the SK provider shared library. The provider relays requests to the Android app, which prompts for biometric confirmation before generating keys or signing. Private keys never leave Android Keystore — only public keys and signatures cross the transport boundary.
 
 ## Repository layout
 
 ```
 PocketKey/
 ├── android/   Android app (Kotlin/Compose) — key management, BLE GATT server, biometric signing
-├── proxy/     Linux desktop proxy (Go + C) — BLE client, OpenSSH SK provider
+├── desktop/   Linux desktop client (Go + C) — BLE client, OpenSSH SK provider
 │   ├── cmd/pocket-agent/   CLI for pairing, diagnostics, and attestation verification
 │   ├── internal/
 │   │   ├── ble/            BLE GATT client with auto-reconnect and encrypted transport
 │   │   └── pairing/        Ed25519 device key management and QR code generation
 │   └── sk/                 libpocket-sk.so — OpenSSH SecurityKeyProvider shared library
-└── termux/    On-device Termux proxy (Go) — SK provider via Android broadcast IPC
+└── termux/    On-device Termux client (Go) — SK provider via Android broadcast IPC
     └── sk/                 libpocket-sk.so — SecurityKeyProvider for Termux (no BLE needed)
 ```
 
@@ -65,7 +75,7 @@ Tap a key row to access:
 - **Rename** — change the display label
 - **Delete** — remove the key from Keystore
 
-## Desktop proxy
+## Desktop (BLE)
 
 ### Requirements
 
@@ -76,7 +86,7 @@ Tap a key row to access:
 ### Build
 
 ```bash
-cd proxy
+cd desktop
 
 # CLI (pair, test)
 go build ./cmd/pocket-agent/
@@ -157,7 +167,7 @@ ssh myserver   # biometric prompt appears on phone
 **Option C — system install:**
 
 ```bash
-cd proxy/sk && sudo make install
+cd desktop/sk && sudo make install
 # installs to /usr/local/lib/libpocket-sk.so
 ```
 

@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  build-proxy:
+  build-desktop:
     runs-on: ubuntu-latest
 
     strategy:
@@ -34,7 +34,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: proxy/go.mod
+          go-version-file: desktop/go.mod
 
       - name: Install cross-compiler
         if: matrix.goarch == 'arm64'
@@ -44,7 +44,7 @@ jobs:
 
       - name: Build CLI
         if: matrix.component == 'pocket-agent'
-        working-directory: proxy
+        working-directory: desktop
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -55,7 +55,7 @@ jobs:
 
       - name: Build SK provider
         if: matrix.component == 'libpocket-sk'
-        working-directory: proxy
+        working-directory: desktop
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -70,11 +70,11 @@ jobs:
           name="${{ matrix.component }}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
           mkdir -p dist
           if [ "${{ matrix.component }}" = "pocket-agent" ]; then
-            cp proxy/pocket-agent "dist/${name}"
+            cp desktop/pocket-agent "dist/${name}"
             tar -C dist -czf "dist/${name}.tar.gz" "${name}"
             rm -f "dist/${name}"
           else
-            cp proxy/libpocket-sk.so "dist/${name}.so"
+            cp desktop/libpocket-sk.so "dist/${name}.so"
             tar -C dist -czf "dist/${name}.tar.gz" "${name}.so"
             rm -f "dist/${name}.so"
           fi

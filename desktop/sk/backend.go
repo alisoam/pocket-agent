@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/pocket-agent-proxy/internal/ble"
+	"github.com/example/pocket-agent-desktop/internal/ble"
 )
 
 const (

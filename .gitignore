@@ -1,5 +1,5 @@
 .DS_Store
-proxy/pocket-agent
+desktop/pocket-agent
 
 # Compiled binaries
 *.o

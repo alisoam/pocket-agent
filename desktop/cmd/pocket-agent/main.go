@@ -7,8 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/example/pocket-agent-proxy/internal/ble"
-	"github.com/example/pocket-agent-proxy/internal/pairing"
+	"github.com/example/pocket-agent-desktop/internal/ble"
+	"github.com/example/pocket-agent-desktop/internal/pairing"
 )
 
 func main() {

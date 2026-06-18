@@ -9,7 +9,8 @@ PocketSSHAgent is a remote SSH agent for Android that stores Ed25519 keys in And
 ```
 PocketSSHAgent/
 ├── android/   ← Android app (Kotlin/Compose)
-└── proxy/     ← Linux desktop proxy (Go)
+├── desktop/   ← Linux desktop client (Go + C) — BLE transport
+└── termux/    ← On-device Termux client (Go) — broadcast IPC
 ```
 
 ## Android App
@@ -135,20 +136,20 @@ Required permissions (see `android/app/src/main/AndroidManifest.xml`):
 
 BleAgentService registered as `connectedDevice` foreground service type.
 
-## Desktop Proxy (`proxy/`)
+## Desktop BLE (`desktop/`)
 
-A Linux Go proxy that connects to the phone over BLE and makes the phone's SSH keys available to the desktop. Two integration modes are supported:
+A Linux Go client that connects to the phone over BLE and makes the phone's SSH keys available to the desktop. Two integration modes are supported:
 
 ### SSH Agent mode (primary)
-Exposes a Unix domain socket as `SSH_AUTH_SOCK`. SSH clients talk to the socket; the proxy forwards requests over BLE to the phone.
+Exposes a Unix domain socket as `SSH_AUTH_SOCK`. SSH clients talk to the socket; the client forwards requests over BLE to the phone.
 
 ### PKCS#11 mode
 A shared library (`libpocket-pkcs11.so`) that any PKCS#11-capable application (OpenSSH, git) can load directly without a background daemon.
 
-### Proxy Architecture
+### Architecture
 
 ```
-proxy/
+desktop/
 ├── cmd/pocket-agent/main.go   ← CLI: pair / run / test subcommands
 ├── internal/
 │   ├── agent/server.go        ← Unix socket server (SSH agent protocol)
@@ -163,7 +164,7 @@ proxy/
     └── libpocket-pkcs11.so    ← Built shared library
 ```
 
-### Proxy Key Components
+### Key Components
 
 **`internal/ble/client.go` — BLE Client**
 - Scans for the phone's custom GATT service UUID
@@ -193,10 +194,10 @@ proxy/
 - C layer (`provider.c`) implements the PKCS#11 API; routes calls to Go via CGO bridge
 - Each Android key becomes two objects: `CKO_PUBLIC_KEY` and `CKO_PRIVATE_KEY`
 - Reuses the same BLE + SSH agent backend as the socket mode
-- Build: `cd proxy/pkcs11 && make` → produces `libpocket-pkcs11.so`
+- Build: `cd desktop/pkcs11 && make` → produces `libpocket-pkcs11.so`
 - Usage: `ssh -I /path/to/libpocket-pkcs11.so user@host`
 
-### Proxy CLI
+### CLI
 
 ```
 pocket-agent pair   # Generate QR code for phone pairing
@@ -206,12 +207,12 @@ pocket-agent test   # Diagnostic: BLE connect + auth + list keys
 
 Config dir: `~/.config/pocket-agent/` (keys stored here)
 
-### Proxy Dependencies
+### Dependencies
 
 - `tinygo.org/x/bluetooth` — BLE GATT client (Linux/BlueZ via D-Bus)
 - `github.com/skip2/go-qrcode` — QR code generation
 
-Build: `cd proxy && go build ./cmd/pocket-agent/`
+Build: `cd desktop && go build ./cmd/pocket-agent/`
 
 ## Known Constraints
 
