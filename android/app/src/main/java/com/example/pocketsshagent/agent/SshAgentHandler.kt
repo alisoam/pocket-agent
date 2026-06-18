@@ -38,6 +38,12 @@ class SshAgentHandler(
         enrollInProgress.set(false)
     }
 
+    fun forceLocalAuth() {
+        authenticated = true
+        authenticatedDeviceKey = null
+        sessionCrypto = null
+    }
+
     fun handleMessage(message: ByteArray, onResponse: (ByteArray) -> Unit) {
         if (message.isEmpty()) {
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))

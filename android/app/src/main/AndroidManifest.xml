@@ -38,6 +38,14 @@
             android:name=".ble.BleAgentService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <service
+            android:name=".termux.TermuxAgentService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.pocketsshagent.BIND_TERMUX_AGENT" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>

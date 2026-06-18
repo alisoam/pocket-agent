@@ -1,0 +1,337 @@
+package main
+
+/*
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+struct sk_enroll_response {
+	uint8_t  flags;
+	uint8_t *public_key;
+	size_t   public_key_len;
+	uint8_t *key_handle;
+	size_t   key_handle_len;
+	uint8_t *signature;
+	size_t   signature_len;
+	uint8_t *attestation_cert;
+	size_t   attestation_cert_len;
+	uint8_t *authdata;
+	size_t   authdata_len;
+};
+
+struct sk_sign_response {
+	uint8_t  flags;
+	uint32_t counter;
+	uint8_t *sig_r;
+	size_t   sig_r_len;
+	uint8_t *sig_s;
+	size_t   sig_s_len;
+};
+
+struct sk_resident_key {
+	uint32_t  alg;
+	size_t    slot;
+	char     *application;
+	void     *key;
+	uint8_t   flags;
+	uint8_t  *user_id;
+	size_t    user_id_len;
+};
+
+struct sk_option {
+	char    *name;
+	char    *value;
+	uint8_t  required;
+};
+
+#define SSH_SK_ERR_GENERAL          -1
+#define SSH_SK_ERR_UNSUPPORTED      -2
+#define SSH_SK_ERR_PIN_REQUIRED     -3
+#define SSH_SK_ERR_DEVICE_NOT_FOUND -4
+*/
+import "C"
+import (
+	"encoding/binary"
+	"log"
+	"unsafe"
+)
+
+//export sk_api_version
+func sk_api_version() C.uint32_t {
+	return C.uint32_t(0x000a0000)
+}
+
+//export sk_enroll
+func sk_enroll(
+	alg C.uint32_t,
+	challenge *C.uint8_t,
+	challengeLen C.size_t,
+	application *C.char,
+	flags C.uint8_t,
+	pin *C.char,
+	options **C.struct_sk_option,
+	enrollResponse **C.struct_sk_enroll_response,
+) C.int {
+	_ = pin
+	_ = options
+
+	log.Printf("[SK-TERMUX] sk_enroll: alg=%d flags=0x%02x", alg, flags)
+
+	if uint32(alg) != 0 && uint32(alg) != 1 {
+		return C.int(C.SSH_SK_ERR_UNSUPPORTED)
+	}
+
+	backend := getBackend()
+	if backend == nil {
+		return C.int(C.SSH_SK_ERR_DEVICE_NOT_FOUND)
+	}
+
+	app := C.GoString(application)
+	label := optionValue(options, "label")
+	var challengeBytes []byte
+	if challenge != nil && challengeLen > 0 {
+		challengeBytes = C.GoBytes(unsafe.Pointer(challenge), C.int(challengeLen))
+	}
+
+	pubkey, keyHandle, actualAlg, attestationChain, err := backend.Enroll(app, uint32(alg), byte(flags), label, challengeBytes)
+	if err != nil {
+		log.Printf("[SK-TERMUX] sk_enroll: %v", err)
+		return C.int(C.SSH_SK_ERR_GENERAL)
+	}
+	if actualAlg != uint32(alg) {
+		log.Printf("[SK-TERMUX] sk_enroll: alg mismatch (requested %d, got %d)", alg, actualAlg)
+		return C.int(C.SSH_SK_ERR_UNSUPPORTED)
+	}
+
+	resp := (*C.struct_sk_enroll_response)(C.calloc(1, C.size_t(C.sizeof_struct_sk_enroll_response)))
+	if resp == nil {
+		return C.int(C.SSH_SK_ERR_GENERAL)
+	}
+
+	resp.flags = flags
+
+	resp.public_key = (*C.uint8_t)(C.malloc(C.size_t(len(pubkey))))
+	if resp.public_key == nil {
+		C.free(unsafe.Pointer(resp))
+		return C.int(C.SSH_SK_ERR_GENERAL)
+	}
+	resp.public_key_len = C.size_t(len(pubkey))
+	C.memcpy(unsafe.Pointer(resp.public_key), unsafe.Pointer(&pubkey[0]), C.size_t(len(pubkey)))
+
+	resp.key_handle = (*C.uint8_t)(C.malloc(C.size_t(len(keyHandle))))
+	if resp.key_handle == nil {
+		C.free(unsafe.Pointer(resp.public_key))
+		C.free(unsafe.Pointer(resp))
+		return C.int(C.SSH_SK_ERR_GENERAL)
+	}
+	resp.key_handle_len = C.size_t(len(keyHandle))
+	C.memcpy(unsafe.Pointer(resp.key_handle), unsafe.Pointer(&keyHandle[0]), C.size_t(len(keyHandle)))
+
+	resp.signature = nil
+	resp.signature_len = 0
+	resp.attestation_cert = nil
+	resp.attestation_cert_len = 0
+	resp.authdata = nil
+	resp.authdata_len = 0
+
+	if len(attestationChain) > 0 {
+		leaf := attestationChain[0]
+		resp.attestation_cert = (*C.uint8_t)(C.malloc(C.size_t(len(leaf))))
+		if resp.attestation_cert == nil {
+			C.free(unsafe.Pointer(resp.key_handle))
+			C.free(unsafe.Pointer(resp.public_key))
+			C.free(unsafe.Pointer(resp))
+			return C.int(C.SSH_SK_ERR_GENERAL)
+		}
+		resp.attestation_cert_len = C.size_t(len(leaf))
+		C.memcpy(unsafe.Pointer(resp.attestation_cert), unsafe.Pointer(&leaf[0]), C.size_t(len(leaf)))
+
+		if len(attestationChain) > 1 {
+			intermediates := attestationChain[1:]
+			authSize := 1
+			for _, c := range intermediates {
+				authSize += 2 + len(c)
+			}
+			authBuf := make([]byte, authSize)
+			authBuf[0] = byte(len(intermediates))
+			aOff := 1
+			for _, c := range intermediates {
+				binary.BigEndian.PutUint16(authBuf[aOff:], uint16(len(c)))
+				aOff += 2
+				copy(authBuf[aOff:], c)
+				aOff += len(c)
+			}
+			resp.authdata = (*C.uint8_t)(C.malloc(C.size_t(len(authBuf))))
+			if resp.authdata == nil {
+				C.free(unsafe.Pointer(resp.attestation_cert))
+				C.free(unsafe.Pointer(resp.key_handle))
+				C.free(unsafe.Pointer(resp.public_key))
+				C.free(unsafe.Pointer(resp))
+				return C.int(C.SSH_SK_ERR_GENERAL)
+			}
+			resp.authdata_len = C.size_t(len(authBuf))
+			C.memcpy(unsafe.Pointer(resp.authdata), unsafe.Pointer(&authBuf[0]), C.size_t(len(authBuf)))
+		}
+	}
+
+	*enrollResponse = resp
+	log.Printf("[SK-TERMUX] sk_enroll: success, handle=%q", string(keyHandle))
+	return C.int(0)
+}
+
+//export sk_sign
+func sk_sign(
+	alg C.uint32_t,
+	data *C.uint8_t,
+	datalen C.size_t,
+	application *C.char,
+	keyHandle *C.uint8_t,
+	keyHandleLen C.size_t,
+	flags C.uint8_t,
+	pin *C.char,
+	options **C.struct_sk_option,
+	signResponse **C.struct_sk_sign_response,
+) C.int {
+	_ = pin
+	_ = options
+
+	log.Printf("[SK-TERMUX] sk_sign: alg=%d datalen=%d flags=0x%02x", alg, datalen, flags)
+
+	if uint32(alg) != 0 && uint32(alg) != 1 {
+		return C.int(C.SSH_SK_ERR_UNSUPPORTED)
+	}
+
+	backend := getBackend()
+	if backend == nil {
+		return C.int(C.SSH_SK_ERR_DEVICE_NOT_FOUND)
+	}
+
+	app := C.GoString(application)
+	dataBytes := C.GoBytes(unsafe.Pointer(data), C.int(datalen))
+	handle := C.GoBytes(unsafe.Pointer(keyHandle), C.int(keyHandleLen))
+
+	sigR, sigS, counter, respFlags, err := backend.Sign(uint32(alg), app, handle, dataBytes, byte(flags))
+	if err != nil {
+		log.Printf("[SK-TERMUX] sk_sign: %v", err)
+		return C.int(C.SSH_SK_ERR_GENERAL)
+	}
+
+	resp := (*C.struct_sk_sign_response)(C.calloc(1, C.size_t(C.sizeof_struct_sk_sign_response)))
+	if resp == nil {
+		return C.int(C.SSH_SK_ERR_GENERAL)
+	}
+
+	resp.flags = C.uint8_t(respFlags)
+	resp.counter = C.uint32_t(counter)
+
+	resp.sig_r = (*C.uint8_t)(C.malloc(C.size_t(len(sigR))))
+	if resp.sig_r == nil {
+		C.free(unsafe.Pointer(resp))
+		return C.int(C.SSH_SK_ERR_GENERAL)
+	}
+	resp.sig_r_len = C.size_t(len(sigR))
+	C.memcpy(unsafe.Pointer(resp.sig_r), unsafe.Pointer(&sigR[0]), C.size_t(len(sigR)))
+
+	if sigS != nil {
+		resp.sig_s = (*C.uint8_t)(C.malloc(C.size_t(len(sigS))))
+		if resp.sig_s == nil {
+			C.free(unsafe.Pointer(resp.sig_r))
+			C.free(unsafe.Pointer(resp))
+			return C.int(C.SSH_SK_ERR_GENERAL)
+		}
+		resp.sig_s_len = C.size_t(len(sigS))
+		C.memcpy(unsafe.Pointer(resp.sig_s), unsafe.Pointer(&sigS[0]), C.size_t(len(sigS)))
+	} else {
+		resp.sig_s = nil
+		resp.sig_s_len = 0
+	}
+
+	*signResponse = resp
+	log.Printf("[SK-TERMUX] sk_sign: success, counter=%d", counter)
+	return C.int(0)
+}
+
+//export sk_load_resident_keys
+func sk_load_resident_keys(
+	pin *C.char,
+	options **C.struct_sk_option,
+	rks ***C.struct_sk_resident_key,
+	nrks *C.size_t,
+) C.int {
+	_ = pin
+	_ = options
+	*rks = nil
+	*nrks = 0
+	return C.int(0)
+}
+
+func optionValue(options **C.struct_sk_option, name string) string {
+	if options == nil {
+		return ""
+	}
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+
+	for i := 0; ; i++ {
+		opt := *(**C.struct_sk_option)(unsafe.Pointer(
+			uintptr(unsafe.Pointer(options)) + uintptr(i)*unsafe.Sizeof(*options),
+		))
+		if opt == nil {
+			break
+		}
+		if C.strcmp(opt.name, cName) == 0 && opt.value != nil {
+			return C.GoString(opt.value)
+		}
+	}
+	return ""
+}
+
+//export sk_free_enroll_response
+func sk_free_enroll_response(r *C.struct_sk_enroll_response) {
+	if r == nil {
+		return
+	}
+	if r.public_key != nil {
+		C.free(unsafe.Pointer(r.public_key))
+	}
+	if r.key_handle != nil {
+		C.free(unsafe.Pointer(r.key_handle))
+	}
+	if r.signature != nil {
+		C.free(unsafe.Pointer(r.signature))
+	}
+	if r.attestation_cert != nil {
+		C.free(unsafe.Pointer(r.attestation_cert))
+	}
+	if r.authdata != nil {
+		C.free(unsafe.Pointer(r.authdata))
+	}
+	C.free(unsafe.Pointer(r))
+}
+
+//export sk_free_sign_response
+func sk_free_sign_response(r *C.struct_sk_sign_response) {
+	if r == nil {
+		return
+	}
+	if r.sig_r != nil {
+		C.free(unsafe.Pointer(r.sig_r))
+	}
+	if r.sig_s != nil {
+		C.free(unsafe.Pointer(r.sig_s))
+	}
+	C.free(unsafe.Pointer(r))
+}
+
+//export sk_free_resident_key
+func sk_free_resident_key(k *C.struct_sk_resident_key) {
+	_ = k
+}
+
+//export sk_free_resident_keys
+func sk_free_resident_keys(rks **C.struct_sk_resident_key, nrks C.size_t) {
+	_ = rks
+	_ = nrks
+}
+
+func main() {}

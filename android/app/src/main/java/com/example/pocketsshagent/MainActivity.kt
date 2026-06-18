@@ -56,12 +56,16 @@ import com.example.pocketsshagent.crypto.BiometricAgentCallback
 import com.example.pocketsshagent.crypto.KeyManager
 import com.example.pocketsshagent.model.KeyMetadata
 import com.example.pocketsshagent.pairing.PairingScreen
+import com.example.pocketsshagent.termux.TermuxAgentService
+import com.example.pocketsshagent.termux.TermuxBiometricCallback
 import com.example.pocketsshagent.ui.theme.PocketSSHAgentTheme
 
 class MainActivity : FragmentActivity() {
 
     private var bleService: BleAgentService? = null
     private var biometricCallback: BiometricAgentCallback? = null
+    private var termuxService: TermuxAgentService? = null
+    private var termuxBiometricCallback: TermuxBiometricCallback? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -77,6 +81,23 @@ class MainActivity : FragmentActivity() {
         override fun onServiceDisconnected(name: ComponentName?) {
             bleService = null
             biometricCallback = null
+        }
+    }
+
+    private val termuxServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as TermuxAgentService.LocalBinder
+            val svc = binder.getService()
+            termuxService = svc
+            val cb = TermuxBiometricCallback(this@MainActivity, svc)
+            termuxBiometricCallback = cb
+            svc.setAgentCallback(cb)
+            cb.resumePendingSign()
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            termuxService = null
+            termuxBiometricCallback = null
         }
     }
 
@@ -123,11 +144,16 @@ class MainActivity : FragmentActivity() {
         super.onResume()
         biometricCallback?.resumePendingSign()
         biometricCallback?.resumePendingEnroll()
+        termuxBiometricCallback?.resumePendingSign()
+        termuxBiometricCallback?.resumePendingEnroll()
     }
 
     override fun onDestroy() {
         if (bleService != null) {
             unbindService(serviceConnection)
+        }
+        if (termuxService != null) {
+            unbindService(termuxServiceConnection)
         }
         super.onDestroy()
     }
@@ -136,6 +162,7 @@ class MainActivity : FragmentActivity() {
         val serviceIntent = Intent(this, BleAgentService::class.java)
         startForegroundService(serviceIntent)
         bindService(serviceIntent, serviceConnection, BIND_AUTO_CREATE)
+        bindService(Intent(this, TermuxAgentService::class.java), termuxServiceConnection, BIND_AUTO_CREATE)
     }
 
     private fun hasRequiredPermissions(): Boolean {
