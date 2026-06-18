@@ -52,12 +52,16 @@ PocketKey/
 
 Keys can be created in two ways:
 
-- **From the phone** — tap **+** in the key list, choose a label and algorithm (Ed25519 or ECDSA), and the key is generated immediately.
-- **From the desktop** — run `ssh-keygen -t ed25519-sk -w ./libpocket-sk.so`. The phone shows an **Allow / Deny** dialog before generating the key.
+- **From the phone** — tap **+** in the key list, choose a label, algorithm (Ed25519 or ECDSA), and whether the key is **resident** or **non-resident**.
+- **From the desktop** — run `ssh-keygen -t ed25519-sk -w ./libpocket-sk.so`. Add `-O resident` for a resident key. The phone shows an **Allow / Deny** dialog before generating the key.
+
+**Resident vs non-resident:**
+- **Resident** keys are discoverable — download them to any machine with `ssh-keygen -K -w ./libpocket-sk.so`.
+- **Non-resident** keys require the handle file (`~/.ssh/id_ed25519_sk`) to be present on each machine.
 
 Tap a key row to access:
 - **Public Key** — fingerprint and `authorized_keys` line, ready to copy
-- **Key File** — the full OpenSSH private key file (`-----BEGIN OPENSSH PRIVATE KEY-----`) to place in `~/.ssh/id_ed25519_sk`
+- **Handle** — the OpenSSH private key file (`-----BEGIN OPENSSH PRIVATE KEY-----`) to place in `~/.ssh/id_ed25519_sk`
 - **Rename** — change the display label
 - **Delete** — remove the key from Keystore
 
@@ -107,9 +111,24 @@ ssh-keygen -t ed25519-sk -w ./sk/libpocket-sk.so
 
 # ECDSA P-256
 ssh-keygen -t ecdsa-sk -w ./sk/libpocket-sk.so
+
+# Resident key (downloadable to any machine later)
+ssh-keygen -t ed25519-sk -O resident -w ./sk/libpocket-sk.so
 ```
 
-The phone will show an **Allow / Deny** dialog. On approval it generates the key, and `ssh-keygen` writes the standard key files (`~/.ssh/id_ed25519_sk` and `~/.ssh/id_ed25519_sk.pub`). Alternatively, copy the key file directly from the **Key File** button in the app.
+The phone will show an **Allow / Deny** dialog. On approval it generates the key, and `ssh-keygen` writes the standard key files (`~/.ssh/id_ed25519_sk` and `~/.ssh/id_ed25519_sk.pub`). Alternatively, copy the handle directly from the **Handle** button in the app.
+
+### Downloading resident keys
+
+Resident keys can be downloaded to any machine without needing the original handle file:
+
+```bash
+ssh-keygen -K -w ./sk/libpocket-sk.so
+# Phone shows an Allow/Deny dialog
+# Creates ~/.ssh/id_ed25519_sk_rk and ~/.ssh/id_ed25519_sk_rk.pub
+```
+
+This is useful when setting up a new machine — just pair the phone and download your keys.
 
 ### Using the key
 
@@ -255,14 +274,21 @@ make
 
 ```bash
 ssh-keygen -t ed25519-sk -w ./libpocket-sk.so
+
+# ECDSA
+ssh-keygen -t ecdsa-sk -w ./libpocket-sk.so
+
+# Resident key
+ssh-keygen -t ed25519-sk -O resident -w ./libpocket-sk.so
 ```
 
 The PocketKey app will show an **Allow / Deny** dialog. Tap **Allow** to generate the key.
 
-For ECDSA:
+### Downloading resident keys
 
 ```bash
-ssh-keygen -t ecdsa-sk -w ./libpocket-sk.so
+ssh-keygen -K -w ./libpocket-sk.so
+# Creates ~/.ssh/id_ed25519_sk_rk and ~/.ssh/id_ed25519_sk_rk.pub
 ```
 
 ### Using the key
