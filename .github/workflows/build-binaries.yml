@@ -1,0 +1,139 @@
+name: Build Binaries
+
+on:
+  push:
+    tags:
+      - 'release-*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-proxy:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: pocket-agent
+            goos: linux
+            goarch: amd64
+          - component: pocket-agent
+            goos: linux
+            goarch: arm64
+          - component: libpocket-sk
+            goos: linux
+            goarch: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: proxy/go.mod
+
+      - name: Install cross-compiler
+        if: matrix.goarch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build CLI
+        if: matrix.component == 'pocket-agent'
+        working-directory: proxy
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.goarch == 'amd64' && '0' || '1' }}
+          CC: ${{ matrix.goarch == 'arm64' && 'aarch64-linux-gnu-gcc' || '' }}
+        run: |
+          go build -trimpath -ldflags="-s -w" -o pocket-agent ./cmd/pocket-agent/
+
+      - name: Build SK provider
+        if: matrix.component == 'libpocket-sk'
+        working-directory: proxy
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+        run: |
+          go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o libpocket-sk.so ./sk/
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#release-}"
+          name="${{ matrix.component }}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          mkdir -p dist
+          if [ "${{ matrix.component }}" = "pocket-agent" ]; then
+            cp proxy/pocket-agent "dist/${name}"
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+            rm -f "dist/${name}"
+          else
+            cp proxy/libpocket-sk.so "dist/${name}.so"
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}.so"
+            rm -f "dist/${name}.so"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.component }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/release-')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  build-termux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: termux/sk/go.mod
+
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Termux SK provider
+        working-directory: termux/sk
+        env:
+          GOOS: android
+          GOARCH: arm64
+          CGO_ENABLED: 1
+          CC: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+        run: |
+          go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o libpocket-sk.so .
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#release-}"
+          name="libpocket-sk-termux_${version}_android_arm64"
+          mkdir -p dist
+          cp termux/sk/libpocket-sk.so "dist/${name}.so"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}.so"
+          rm -f "dist/${name}.so"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libpocket-sk-termux-android-arm64
+          path: dist/*
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/release-')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

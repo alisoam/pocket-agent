@@ -1,0 +1,54 @@
+name: Build Android APK
+
+on:
+  push:
+    tags:
+      - 'release-*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Build APK
+        working-directory: android
+        run: ./gradlew assembleRelease
+
+      - name: Derive version
+        id: vars
+        run: |
+          version="${GITHUB_REF_NAME#release-}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          version="${{ steps.vars.outputs.version }}"
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/*.apk "dist/pocket-ssh-agent_${version}.apk" 2>/dev/null || \
+          cp android/app/build/outputs/apk/debug/*.apk "dist/pocket-ssh-agent_${version}.apk" 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/release-')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
