@@ -46,6 +46,11 @@
                 <action android:name="com.example.pocketsshagent.BIND_TERMUX_AGENT" />
             </intent-filter>
         </service>
+
+        <provider
+            android:name=".termux.AgentContentProvider"
+            android:authorities="com.example.pocketsshagent.agent"
+            android:exported="true" />
     </application>
 
 </manifest>

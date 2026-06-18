@@ -1,16 +1,14 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
-	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -21,136 +19,67 @@ const (
 	msgSKSignResponse   byte = 106
 	msgFailure          byte = 5
 
-	packageName = "com.example.pocketsshagent"
-	bridgeClass = "com.example.pocketsshagent.termux.PocketAgentBridge"
+	contentAuthority = "content://com.example.pocketsshagent.agent"
+	signTimeout      = 90 * time.Second
+	defaultTimeout   = 15 * time.Second
 )
 
-type PipeBackend struct {
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-}
+type ContentBackend struct{}
 
-var (
-	globalBackend *PipeBackend
-	backendMu     sync.Mutex
-)
+var globalBackend = &ContentBackend{}
 
-func getBackend() *PipeBackend {
-	backendMu.Lock()
-	defer backendMu.Unlock()
-	if globalBackend != nil && globalBackend.cmd.ProcessState == nil {
-		return globalBackend
-	}
-	globalBackend = nil
-	b, err := startBackend()
-	if err != nil {
-		log.Printf("[SK-TERMUX] Failed to start backend: %v", err)
-		return nil
-	}
-	globalBackend = b
+func getBackend() *ContentBackend {
 	return globalBackend
 }
 
-func discoverAPKPath() (string, error) {
-	out, err := exec.Command("pm", "path", packageName).Output()
-	if err != nil {
-		return "", fmt.Errorf("pm path %s: %w", packageName, err)
-	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "package:") {
-			return strings.TrimPrefix(line, "package:"), nil
-		}
-	}
-	return "", fmt.Errorf("no APK found for %s", packageName)
-}
+func (b *ContentBackend) SendMessage(msg []byte, timeout time.Duration) ([]byte, error) {
+	requestB64 := base64.StdEncoding.EncodeToString(msg)
 
-func startBackend() (*PipeBackend, error) {
-	apkPath, err := discoverAPKPath()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "/system/bin/content", "call",
+		"--uri", contentAuthority,
+		"--method", "handleMessage",
+		"--arg", requestB64)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("content call: %w", err)
+	}
+
+	responseB64, err := parseContentCallOutput(string(out))
 	if err != nil {
 		return nil, err
 	}
 
-	log.Printf("[SK-TERMUX] APK path: %s", apkPath)
+	return base64.StdEncoding.DecodeString(responseB64)
+}
 
-	cmd := exec.Command("app_process", "/", bridgeClass)
-	cmd.Env = append(os.Environ(), "CLASSPATH="+apkPath)
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		stdin.Close()
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		stdin.Close()
-		stdout.Close()
-		return nil, fmt.Errorf("stderr pipe: %w", err)
+func parseContentCallOutput(output string) (string, error) {
+	output = strings.TrimSpace(output)
+	prefix := "Result: Bundle[{"
+	if !strings.HasPrefix(output, prefix) {
+		return "", fmt.Errorf("unexpected content call output: %s", output)
 	}
 
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start app_process: %w", err)
+	inner := output[len(prefix):]
+	idx := strings.Index(inner, "}]")
+	if idx < 0 {
+		return "", fmt.Errorf("malformed content call output: %s", output)
 	}
+	inner = inner[:idx]
 
-	ready := make(chan struct{})
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			line := scanner.Text()
-			log.Printf("[bridge] %s", line)
-			if line == "READY" {
-				close(ready)
-			}
+	for _, pair := range strings.Split(inner, ", ") {
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) == 2 && parts[0] == "r" {
+			return parts[1], nil
 		}
-	}()
-
-	select {
-	case <-ready:
-		log.Printf("[SK-TERMUX] Bridge is ready")
-	case <-time.After(30 * time.Second):
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("bridge did not become ready within 30s")
 	}
-
-	return &PipeBackend{cmd: cmd, stdin: stdin, stdout: stdout}, nil
+	return "", fmt.Errorf("no 'r' key in content call output: %s", output)
 }
 
-func (b *PipeBackend) SendMessage(msg []byte) ([]byte, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(msg)))
-	if _, err := b.stdin.Write(header); err != nil {
-		return nil, fmt.Errorf("write header: %w", err)
-	}
-	if _, err := b.stdin.Write(msg); err != nil {
-		return nil, fmt.Errorf("write message: %w", err)
-	}
-
-	if _, err := io.ReadFull(b.stdout, header); err != nil {
-		return nil, fmt.Errorf("read response header: %w", err)
-	}
-	respLen := binary.BigEndian.Uint32(header)
-	if respLen == 0 || respLen > 65536 {
-		return nil, fmt.Errorf("invalid response length: %d", respLen)
-	}
-
-	resp := make([]byte, respLen)
-	if _, err := io.ReadFull(b.stdout, resp); err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	return resp, nil
-}
-
-func (b *PipeBackend) Enroll(application string, alg uint32, flags byte, label string, challenge []byte) (pubkey, keyHandle []byte, actualAlg uint32, attestationChain [][]byte, err error) {
+func (b *ContentBackend) Enroll(application string, alg uint32, flags byte, label string, challenge []byte) (pubkey, keyHandle []byte, actualAlg uint32, attestationChain [][]byte, err error) {
 	appHash := sha256.Sum256([]byte(application))
 	labelBytes := []byte(label)
 
@@ -179,9 +108,9 @@ func (b *PipeBackend) Enroll(application string, alg uint32, flags byte, label s
 	off += 2
 	copy(msg[off:], challenge)
 
-	resp, err := b.SendMessage(msg)
+	resp, err := b.SendMessage(msg, signTimeout)
 	if err != nil {
-		return nil, nil, 0, nil, fmt.Errorf("enroll: send failed: %w", err)
+		return nil, nil, 0, nil, fmt.Errorf("enroll: %w", err)
 	}
 
 	if len(resp) < 1 || resp[0] == msgFailure {
@@ -236,7 +165,7 @@ func (b *PipeBackend) Enroll(application string, alg uint32, flags byte, label s
 	return pubkey, keyHandle, actualAlg, attestationChain, nil
 }
 
-func (b *PipeBackend) Sign(alg uint32, application string, keyHandle, data []byte, flags byte) (sigR, sigS []byte, counter uint32, respFlags byte, err error) {
+func (b *ContentBackend) Sign(alg uint32, application string, keyHandle, data []byte, flags byte) (sigR, sigS []byte, counter uint32, respFlags byte, err error) {
 	appHash := sha256.Sum256([]byte(application))
 	dataHash := sha256.Sum256(data)
 
@@ -256,9 +185,9 @@ func (b *PipeBackend) Sign(alg uint32, application string, keyHandle, data []byt
 	copy(msg[offset:], dataHash[:])
 
 	log.Println("[SK-TERMUX] Sending sign request (will trigger biometric)...")
-	resp, err := b.SendMessage(msg)
+	resp, err := b.SendMessage(msg, signTimeout)
 	if err != nil {
-		return nil, nil, 0, 0, fmt.Errorf("sign: send failed: %w", err)
+		return nil, nil, 0, 0, fmt.Errorf("sign: %w", err)
 	}
 
 	if len(resp) < 1 || resp[0] == msgFailure {

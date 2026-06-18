@@ -56,6 +56,7 @@ import com.example.pocketsshagent.crypto.BiometricAgentCallback
 import com.example.pocketsshagent.crypto.KeyManager
 import com.example.pocketsshagent.model.KeyMetadata
 import com.example.pocketsshagent.pairing.PairingScreen
+import com.example.pocketsshagent.termux.AgentContentProvider
 import com.example.pocketsshagent.termux.TermuxAgentService
 import com.example.pocketsshagent.termux.TermuxBiometricCallback
 import com.example.pocketsshagent.ui.theme.PocketSSHAgentTheme
@@ -92,6 +93,7 @@ class MainActivity : FragmentActivity() {
             val cb = TermuxBiometricCallback(this@MainActivity, svc)
             termuxBiometricCallback = cb
             svc.setAgentCallback(cb)
+            AgentContentProvider.agentCallback = cb
             cb.resumePendingSign()
         }
 
