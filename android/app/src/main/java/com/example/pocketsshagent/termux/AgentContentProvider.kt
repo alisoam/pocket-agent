@@ -26,8 +26,7 @@ class AgentContentProvider : ContentProvider() {
 
         @Volatile var agentCallback: AgentCallback? = null
 
-        val signingInProgress = AtomicBoolean(false)
-        val enrollInProgress = AtomicBoolean(false)
+        val operationInProgress = AtomicBoolean(false)
 
         @Volatile var pendingSignRequest: PendingSignRequest? = null
         @Volatile var pendingEnrollRequest: PendingEnrollRequest? = null
@@ -123,7 +122,7 @@ class AgentContentProvider : ContentProvider() {
                     onResult(false)
                 }
             }
-        }, null, signingInProgress, enrollInProgress)
+        }, null, operationInProgress)
     }
 
     override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? = null

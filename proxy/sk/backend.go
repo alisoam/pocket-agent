@@ -16,8 +16,10 @@ const (
 	msgSKEnrollRequest  byte = 103
 	msgSKEnrollResponse byte = 104
 	msgSKSignRequest    byte = 105
-	msgSKSignResponse   byte = 106
-	msgFailure          byte = 5
+	msgSKSignResponse          byte = 106
+	msgSKLoadResidentRequest   byte = 107
+	msgSKLoadResidentResponse  byte = 108
+	msgFailure                 byte = 5
 )
 
 // SKBackend manages BLE communication for the SK provider.
@@ -266,4 +268,68 @@ func (b *SKBackend) Sign(alg uint32, application string, keyHandle, data []byte,
 
 	log.Printf("[SK] Sign succeeded: alg=%d counter=%d flags=0x%02x", alg, counter, respFlags)
 	return sigR, sigS, counter, respFlags, nil
+}
+
+type ResidentKey struct {
+	Alg    uint32
+	App    string
+	PubKey []byte
+	Handle []byte
+	Flags  byte
+}
+
+func (b *SKBackend) LoadResidentKeys() ([]ResidentKey, error) {
+	if err := b.ensureConnected(); err != nil {
+		return nil, err
+	}
+
+	msg := []byte{msgSKLoadResidentRequest}
+	resp, err := b.connMgr.SendMessage(msg)
+	if err != nil {
+		return nil, fmt.Errorf("load resident keys: %w", err)
+	}
+
+	if len(resp) < 1 || resp[0] == msgFailure {
+		return nil, fmt.Errorf("load resident keys: rejected by phone")
+	}
+	if resp[0] != msgSKLoadResidentResponse {
+		return nil, fmt.Errorf("load resident keys: unexpected response type %d", resp[0])
+	}
+	if len(resp) < 3 {
+		return nil, fmt.Errorf("load resident keys: response too short")
+	}
+
+	numKeys := int(binary.BigEndian.Uint16(resp[1:3]))
+	off := 3
+	keys := make([]ResidentKey, 0, numKeys)
+
+	for i := 0; i < numKeys; i++ {
+		if off >= len(resp) {
+			return nil, fmt.Errorf("load resident keys: truncated at key %d", i)
+		}
+		alg := uint32(resp[off]); off++
+
+		if off+2 > len(resp) { return nil, fmt.Errorf("load resident keys: truncated at key %d app len", i) }
+		appLen := int(binary.BigEndian.Uint16(resp[off:])); off += 2
+		if off+appLen > len(resp) { return nil, fmt.Errorf("load resident keys: truncated at key %d app", i) }
+		app := string(resp[off : off+appLen]); off += appLen
+
+		if off+2 > len(resp) { return nil, fmt.Errorf("load resident keys: truncated at key %d pubkey len", i) }
+		pubLen := int(binary.BigEndian.Uint16(resp[off:])); off += 2
+		if off+pubLen > len(resp) { return nil, fmt.Errorf("load resident keys: truncated at key %d pubkey", i) }
+		pubKey := make([]byte, pubLen); copy(pubKey, resp[off:off+pubLen]); off += pubLen
+
+		if off+2 > len(resp) { return nil, fmt.Errorf("load resident keys: truncated at key %d handle len", i) }
+		handleLen := int(binary.BigEndian.Uint16(resp[off:])); off += 2
+		if off+handleLen > len(resp) { return nil, fmt.Errorf("load resident keys: truncated at key %d handle", i) }
+		handle := make([]byte, handleLen); copy(handle, resp[off:off+handleLen]); off += handleLen
+
+		if off >= len(resp) { return nil, fmt.Errorf("load resident keys: truncated at key %d flags", i) }
+		flags := resp[off]; off++
+
+		keys = append(keys, ResidentKey{Alg: alg, App: app, PubKey: pubKey, Handle: handle, Flags: flags})
+	}
+
+	log.Printf("[SK] Loaded %d resident keys", len(keys))
+	return keys, nil
 }

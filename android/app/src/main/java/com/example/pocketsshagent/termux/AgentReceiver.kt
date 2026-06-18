@@ -20,8 +20,7 @@ class AgentReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "AgentReceiver"
         private const val TIMEOUT_SECONDS = 90L
-        private val signingInProgress = AtomicBoolean(false)
-        private val enrollInProgress = AtomicBoolean(false)
+        private val operationInProgress = AtomicBoolean(false)
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -93,6 +92,15 @@ class AgentReceiver : BroadcastReceiver() {
                     onResult(false)
                 }
             }
-        }, null, signingInProgress, enrollInProgress)
+            override fun requestResidentKeysAccess(count: Int, deviceName: String?, onResult: (Boolean) -> Unit) {
+                val cb = AgentContentProvider.agentCallback
+                if (cb != null) {
+                    cb.requestResidentKeysAccess(count, deviceName ?: "Termux", onResult)
+                } else {
+                    Log.w(TAG, "No AgentCallback set, denying resident key access")
+                    onResult(false)
+                }
+            }
+        }, null, operationInProgress)
     }
 }

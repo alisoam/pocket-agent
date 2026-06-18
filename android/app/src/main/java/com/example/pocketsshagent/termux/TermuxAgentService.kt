@@ -31,11 +31,15 @@ class TermuxAgentService : Service() {
         private const val ENROLL_CHANNEL_ID = "ssh_enroll_requests"
         private const val SIGN_NOTIFICATION_ID = 100
         private const val ENROLL_NOTIFICATION_ID = 101
+        private const val RESIDENT_ACCESS_CHANNEL_ID = "ssh_resident_access"
+        private const val RESIDENT_ACCESS_NOTIFICATION_ID = 102
         const val ACTION_BIND_AGENT = "com.example.pocketsshagent.BIND_TERMUX_AGENT"
         const val ACTION_TERMUX_SIGN_REQUEST = "com.example.pocketsshagent.ACTION_TERMUX_SIGN_REQUEST"
         const val ACTION_TERMUX_CANCEL_SIGN = "com.example.pocketsshagent.ACTION_TERMUX_CANCEL_SIGN"
         const val ACTION_TERMUX_ENROLL_REQUEST = "com.example.pocketsshagent.ACTION_TERMUX_ENROLL_REQUEST"
         const val ACTION_TERMUX_CANCEL_ENROLL = "com.example.pocketsshagent.ACTION_TERMUX_CANCEL_ENROLL"
+        const val ACTION_TERMUX_RESIDENT_ACCESS = "com.example.pocketsshagent.ACTION_TERMUX_RESIDENT_ACCESS"
+        const val ACTION_TERMUX_CANCEL_RESIDENT_ACCESS = "com.example.pocketsshagent.ACTION_TERMUX_CANCEL_RESIDENT_ACCESS"
         private const val SIGN_REQUEST_TIMEOUT_MS = 30_000L
         private const val ENROLL_REQUEST_TIMEOUT_MS = 60_000L
         private const val BINDER_TIMEOUT_SECONDS = 90L
@@ -56,11 +60,16 @@ class TermuxAgentService : Service() {
         val onResult: (Boolean) -> Unit
     )
 
+    data class PendingResidentAccessRequest(
+        val count: Int,
+        val deviceName: String?,
+        val onResult: (Boolean) -> Unit
+    )
+
     private lateinit var trustStore: TrustStore
     private lateinit var keyManager: KeyManager
 
-    private val signingInProgress = AtomicBoolean(false)
-    private val enrollInProgress = AtomicBoolean(false)
+    private val operationInProgress = AtomicBoolean(false)
 
     private val handlers = mutableMapOf<Int, SshAgentHandler>()
 
@@ -68,10 +77,12 @@ class TermuxAgentService : Service() {
     @Volatile private var agentCallback: AgentCallback? = null
     @Volatile private var pendingSignRequest: PendingSignRequest? = null
     @Volatile private var pendingEnrollRequest: PendingEnrollRequest? = null
+    @Volatile private var pendingResidentAccessRequest: PendingResidentAccessRequest? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val signTimeoutRunnable = Runnable { cancelPendingSignRequest() }
     private val enrollTimeoutRunnable = Runnable { cancelPendingEnrollRequest() }
+    private val residentAccessTimeoutRunnable = Runnable { cancelPendingResidentAccessRequest() }
 
     private val agentAidlBinder = object : IPocketAgent.Stub() {
         override fun handleMessage(message: ByteArray): ByteArray {
@@ -125,14 +136,20 @@ class TermuxAgentService : Service() {
             cancelPendingEnrollRequest()
             return START_NOT_STICKY
         }
+        if (intent?.action == ACTION_TERMUX_CANCEL_RESIDENT_ACCESS) {
+            cancelPendingResidentAccessRequest()
+            return START_NOT_STICKY
+        }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(signTimeoutRunnable)
         mainHandler.removeCallbacks(enrollTimeoutRunnable)
+        mainHandler.removeCallbacks(residentAccessTimeoutRunnable)
         cancelPendingSignRequest()
         cancelPendingEnrollRequest()
+        cancelPendingResidentAccessRequest()
         synchronized(handlers) { handlers.clear() }
         super.onDestroy()
     }
@@ -157,7 +174,7 @@ class TermuxAgentService : Service() {
                     onResult(false)
                 }
             }
-        }, null, signingInProgress, enrollInProgress)
+        }, null, operationInProgress)
     }
 
     fun setPendingSignRequest(request: PendingSignRequest) {
@@ -210,6 +227,33 @@ class TermuxAgentService : Service() {
         getSystemService(NotificationManager::class.java).cancel(ENROLL_NOTIFICATION_ID)
         if (req != null) {
             Log.d(TAG, "Pending enroll request cancelled")
+            req.onResult(false)
+        }
+    }
+
+    fun setPendingResidentAccessRequest(request: PendingResidentAccessRequest) {
+        pendingResidentAccessRequest = request
+        mainHandler.removeCallbacks(residentAccessTimeoutRunnable)
+        mainHandler.postDelayed(residentAccessTimeoutRunnable, ENROLL_REQUEST_TIMEOUT_MS)
+    }
+
+    fun consumePendingResidentAccessRequest(): PendingResidentAccessRequest? {
+        mainHandler.removeCallbacks(residentAccessTimeoutRunnable)
+        val req = pendingResidentAccessRequest
+        pendingResidentAccessRequest = null
+        if (req != null) {
+            getSystemService(NotificationManager::class.java).cancel(RESIDENT_ACCESS_NOTIFICATION_ID)
+        }
+        return req
+    }
+
+    private fun cancelPendingResidentAccessRequest() {
+        mainHandler.removeCallbacks(residentAccessTimeoutRunnable)
+        val req = pendingResidentAccessRequest
+        pendingResidentAccessRequest = null
+        getSystemService(NotificationManager::class.java).cancel(RESIDENT_ACCESS_NOTIFICATION_ID)
+        if (req != null) {
+            Log.d(TAG, "Pending resident access request cancelled")
             req.onResult(false)
         }
     }
@@ -268,6 +312,33 @@ class TermuxAgentService : Service() {
         getSystemService(NotificationManager::class.java).notify(ENROLL_NOTIFICATION_ID, notification)
     }
 
+    fun postResidentAccessNotification(count: Int, deviceName: String?) {
+        val tapIntent = Intent(this, MainActivity::class.java).apply {
+            action = ACTION_TERMUX_RESIDENT_ACCESS
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val tapPi = PendingIntent.getActivity(
+            this, 12, tapIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val cancelPi = PendingIntent.getService(
+            this, 12,
+            Intent(this, TermuxAgentService::class.java).apply { action = ACTION_TERMUX_CANCEL_RESIDENT_ACCESS },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val contentText = if (deviceName != null) "Termux ($deviceName) wants to download $count resident key(s)" else "Termux wants to download $count resident key(s)"
+        val notification = Notification.Builder(this, RESIDENT_ACCESS_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setContentTitle("Resident Key Access (Termux)")
+            .setContentText(contentText)
+            .setContentIntent(tapPi)
+            .setDeleteIntent(cancelPi)
+            .setAutoCancel(true)
+            .setPriority(Notification.PRIORITY_HIGH)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(RESIDENT_ACCESS_NOTIFICATION_ID, notification)
+    }
+
     private fun createNotificationChannels() {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
@@ -283,6 +354,13 @@ class TermuxAgentService : Service() {
                 "SSH Key Creation Requests",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply { description = "Tap to approve or deny new SSH key creation" }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(
+                RESIDENT_ACCESS_CHANNEL_ID,
+                "Resident Key Access Requests",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply { description = "Tap to approve or deny resident key downloads" }
         )
     }
 }

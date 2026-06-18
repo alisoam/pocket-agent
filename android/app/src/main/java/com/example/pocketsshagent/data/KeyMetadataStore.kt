@@ -19,7 +19,8 @@ class KeyMetadataStore(context: Context) {
                 createdAtEpochMs = item.getLong("createdAtEpochMs"),
                 lastUsedAtEpochMs = if (item.has("lastUsedAtEpochMs")) item.getLong("lastUsedAtEpochMs") else null,
                 hardwareBacked = item.getBoolean("hardwareBacked"),
-                skCounter = if (item.has("skCounter")) item.getLong("skCounter") else 0
+                skCounter = if (item.has("skCounter")) item.getLong("skCounter") else 0,
+                resident = if (item.has("resident")) item.getBoolean("resident") else false
             )
             result[alias] = metadata
         }
@@ -36,6 +37,7 @@ class KeyMetadataStore(context: Context) {
         }
         item.put("hardwareBacked", metadata.hardwareBacked)
         item.put("skCounter", metadata.skCounter)
+        item.put("resident", metadata.resident)
         root.put(metadata.alias, item)
         saveRoot(root)
     }

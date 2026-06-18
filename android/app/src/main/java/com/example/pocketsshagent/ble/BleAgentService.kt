@@ -84,8 +84,7 @@ class BleAgentService : Service() {
     private lateinit var keyManager: KeyManager
 
     // Shared locks — only one signing or enroll dialog at a time across all devices.
-    private val signingInProgress = AtomicBoolean(false)
-    private val enrollInProgress = AtomicBoolean(false)
+    private val operationInProgress = AtomicBoolean(false)
     // Which device addr currently holds the signing lock (null when idle).
     @Volatile private var signingDeviceAddr: String? = null
 
@@ -300,7 +299,7 @@ class BleAgentService : Service() {
                     onResult(false)
                 }
             }
-        }, trustStore, signingInProgress, enrollInProgress)
+        }, trustStore, operationInProgress)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -381,7 +380,7 @@ class BleAgentService : Service() {
                 subscribedDevices.remove(device)
                 // If this device held the foreground signing lock, release it.
                 if (signingDeviceAddr == addr) {
-                    signingInProgress.set(false)
+                    operationInProgress.set(false)
                     signingDeviceAddr = null
                 }
                 cancelPendingSignRequest()

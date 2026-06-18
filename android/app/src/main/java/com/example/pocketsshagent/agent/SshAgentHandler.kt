@@ -14,14 +14,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 interface AgentCallback {
     fun requestBiometricSign(alias: String, keyLabel: String, deviceName: String?, data: ByteArray, onResult: (ByteArray?) -> Unit)
     fun requestEnrollConfirmation(label: String, alg: String, deviceName: String?, onResult: (Boolean) -> Unit)
+    fun requestResidentKeysAccess(count: Int, deviceName: String?, onResult: (Boolean) -> Unit) {
+        onResult(true)
+    }
 }
 
 class SshAgentHandler(
     private val keyManager: KeyManager,
     private val callback: AgentCallback,
     private val trustStore: TrustStore? = null,
-    private val signingInProgress: AtomicBoolean = AtomicBoolean(false),
-    private val enrollInProgress: AtomicBoolean = AtomicBoolean(false)
+    private val operationInProgress: AtomicBoolean = AtomicBoolean(false)
 ) {
     companion object {
         private const val TAG = "SshAgentHandler"
@@ -35,7 +37,7 @@ class SshAgentHandler(
         authenticated = false
         authenticatedDeviceKey = null
         sessionCrypto = null
-        enrollInProgress.set(false)
+        operationInProgress.set(false)
     }
 
     fun forceLocalAuth() {
@@ -94,6 +96,10 @@ class SshAgentHandler(
             AgentMessageType.SK_SIGN_REQUEST -> {
                 if (!requireAuth(respond)) return
                 handleSkSign(plaintext, respond)
+            }
+            AgentMessageType.SK_LOAD_RESIDENT_REQUEST -> {
+                if (!requireAuth(respond)) return
+                handleSkLoadResident(respond)
             }
             else -> respond(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
         }
@@ -192,7 +198,7 @@ class SshAgentHandler(
      * hardware attestation chain (leaf-first). For Ed25519 or absent challenge, cert_count=0.
      */
     private fun handleSkEnroll(message: ByteArray, onResponse: (ByteArray) -> Unit) {
-        if (!enrollInProgress.compareAndSet(false, true)) {
+        if (!operationInProgress.compareAndSet(false, true)) {
             Log.w(TAG, "SK enroll: rejected — enroll already in progress")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
@@ -201,7 +207,7 @@ class SshAgentHandler(
         val req = try {
             AgentMessageParser.parseSkEnrollRequest(message)
         } catch (e: Exception) {
-            enrollInProgress.set(false)
+            operationInProgress.set(false)
             Log.e(TAG, "SK enroll: parse failed: $e")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
@@ -209,7 +215,7 @@ class SshAgentHandler(
 
         val isEcdsa = req.alg == 0
         if (req.alg != 0 && req.alg != 1) {
-            enrollInProgress.set(false)
+            operationInProgress.set(false)
             Log.w(TAG, "SK enroll: unsupported algorithm ${req.alg}")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
@@ -221,7 +227,7 @@ class SshAgentHandler(
         val deviceName = authenticatedDeviceKey?.let { trustStore?.getDevice(it)?.label }
 
         callback.requestEnrollConfirmation(label, algName, deviceName) { accepted ->
-            enrollInProgress.set(false)
+            operationInProgress.set(false)
             if (!accepted) {
                 Log.i(TAG, "SK enroll: user rejected key creation for '$label'")
                 onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
@@ -234,8 +240,9 @@ class SshAgentHandler(
     private fun doEnroll(req: SkEnrollRequest, label: String, isEcdsa: Boolean, onResponse: (ByteArray) -> Unit) {
         // Attestation is only available for EC keys on Android Keystore.
         val challenge = if (isEcdsa && req.attestationChallenge.isNotEmpty()) req.attestationChallenge else null
+        val resident = (req.flags.toInt() and 0x20) != 0
         val metadata = try {
-            keyManager.generateKey(label, isEcdsa, challenge)
+            keyManager.generateKey(label, isEcdsa, challenge, resident)
         } catch (e: Exception) {
             Log.e(TAG, "SK enroll: key generation failed: $e")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
@@ -324,7 +331,7 @@ class SshAgentHandler(
      *   ECDSA:   sig[0:32] = R, sig[32:64] = S
      */
     private fun handleSkSign(message: ByteArray, onResponse: (ByteArray) -> Unit) {
-        if (!signingInProgress.compareAndSet(false, true)) {
+        if (!operationInProgress.compareAndSet(false, true)) {
             Log.w(TAG, "SK sign: rejected — signing already in progress")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
@@ -333,14 +340,14 @@ class SshAgentHandler(
         val req = try {
             AgentMessageParser.parseSkSignRequest(message)
         } catch (e: Exception) {
-            signingInProgress.set(false)
+            operationInProgress.set(false)
             Log.e(TAG, "SK sign: parse failed: $e")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
         }
 
         if (keyManager.listKeys().none { it.alias == req.handle }) {
-            signingInProgress.set(false)
+            operationInProgress.set(false)
             Log.w(TAG, "SK sign: unknown key handle: ${req.handle}")
             onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
             return
@@ -369,7 +376,7 @@ class SshAgentHandler(
         val deviceName = authenticatedDeviceKey?.let { trustStore?.getDevice(it)?.label }
 
         callback.requestBiometricSign(req.handle, keyLabel, deviceName, dataToSign) { signature ->
-            signingInProgress.set(false)
+            operationInProgress.set(false)
             if (signature == null) {
                 onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
                 return@requestBiometricSign
@@ -403,5 +410,76 @@ class SshAgentHandler(
             response[69] = (req.flags.toInt() or 0x01).toByte()
             onResponse(SshWireFormat.frameMessage(response))
         }
+    }
+
+    private fun handleSkLoadResident(onResponse: (ByteArray) -> Unit) {
+        if (!operationInProgress.compareAndSet(false, true)) {
+            Log.w(TAG, "SK load resident: rejected — another operation in progress")
+            onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+            return
+        }
+
+        val allKeys = keyManager.listKeys()
+        val residentKeys = allKeys.filter { it.resident }
+        Log.i(TAG, "SK load resident: ${residentKeys.size} resident keys of ${allKeys.size} total")
+
+        val deviceName = authenticatedDeviceKey?.let { trustStore?.getDevice(it)?.label }
+        callback.requestResidentKeysAccess(residentKeys.size, deviceName) { accepted ->
+            if (!accepted) {
+                operationInProgress.set(false)
+                Log.i(TAG, "SK load resident: user denied access")
+                onResponse(SshWireFormat.frameMessage(AgentMessageBuilder.failure()))
+                return@requestResidentKeysAccess
+            }
+            doLoadResident(residentKeys, onResponse)
+        }
+    }
+
+    private fun doLoadResident(residentKeys: List<com.example.pocketsshagent.model.KeyMetadata>, onResponse: (ByteArray) -> Unit) {
+
+        data class ResidentEntry(val alg: Byte, val app: ByteArray, val pubkey: ByteArray, val handle: ByteArray, val flags: Byte)
+
+        val entries = mutableListOf<ResidentEntry>()
+        val defaultApp = "ssh:".toByteArray(Charsets.UTF_8)
+
+        for (meta in residentKeys) {
+            try {
+                val algorithm = keyManager.getKeyAlgorithm(meta.alias)
+                val isEcdsa = algorithm == "EC"
+                val alg: Byte = if (isEcdsa) 0 else 1
+                val encoded = keyManager.getPublicKey(meta.alias).encoded
+                val rawPubKey = if (isEcdsa) SshWireFormat.extractRawP256PublicKey(encoded)
+                               else SshWireFormat.extractRawEd25519PublicKey(encoded)
+                val handle = meta.alias.toByteArray(Charsets.UTF_8)
+                entries.add(ResidentEntry(alg, defaultApp, rawPubKey, handle, 0x01))
+            } catch (e: Exception) {
+                Log.w(TAG, "SK load resident: skipping ${meta.alias}: $e")
+            }
+        }
+
+        var size = 1 + 2
+        for (e in entries) {
+            size += 1 + 2 + e.app.size + 2 + e.pubkey.size + 2 + e.handle.size + 1
+        }
+        val response = ByteArray(size)
+        var off = 0
+        response[off++] = AgentMessageType.SK_LOAD_RESIDENT_RESPONSE
+        response[off++] = (entries.size shr 8).toByte()
+        response[off++] = (entries.size and 0xFF).toByte()
+        for (e in entries) {
+            response[off++] = e.alg
+            response[off++] = (e.app.size shr 8).toByte()
+            response[off++] = (e.app.size and 0xFF).toByte()
+            System.arraycopy(e.app, 0, response, off, e.app.size); off += e.app.size
+            response[off++] = (e.pubkey.size shr 8).toByte()
+            response[off++] = (e.pubkey.size and 0xFF).toByte()
+            System.arraycopy(e.pubkey, 0, response, off, e.pubkey.size); off += e.pubkey.size
+            response[off++] = (e.handle.size shr 8).toByte()
+            response[off++] = (e.handle.size and 0xFF).toByte()
+            System.arraycopy(e.handle, 0, response, off, e.handle.size); off += e.handle.size
+            response[off++] = e.flags
+        }
+        operationInProgress.set(false)
+        onResponse(SshWireFormat.frameMessage(response))
     }
 }

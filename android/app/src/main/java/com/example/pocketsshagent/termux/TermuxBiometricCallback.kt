@@ -56,6 +56,38 @@ class TermuxBiometricCallback(
         showEnrollDialog(req.label, req.alg, req.deviceName, req.onResult)
     }
 
+    override fun requestResidentKeysAccess(count: Int, deviceName: String?, onResult: (Boolean) -> Unit) {
+        activity.runOnUiThread {
+            if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                showResidentAccessDialog(count, deviceName, onResult)
+            } else {
+                Log.d(TAG, "App not in foreground, posting resident access notification")
+                service.setPendingResidentAccessRequest(TermuxAgentService.PendingResidentAccessRequest(count, deviceName, onResult))
+                service.postResidentAccessNotification(count, deviceName)
+            }
+        }
+    }
+
+    fun resumePendingResidentAccess() {
+        val req = service.consumePendingResidentAccessRequest() ?: return
+        Log.d(TAG, "Resuming pending resident access request")
+        showResidentAccessDialog(req.count, req.deviceName, req.onResult)
+    }
+
+    private fun showResidentAccessDialog(count: Int, deviceName: String?, onResult: (Boolean) -> Unit) {
+        val message = buildString {
+            append("Allow downloading $count resident key(s)?")
+            if (deviceName != null) append("\n\nRequested by: $deviceName")
+        }
+        android.app.AlertDialog.Builder(activity)
+            .setTitle("Resident Key Access")
+            .setMessage(message)
+            .setPositiveButton("Allow") { _, _ -> onResult(true) }
+            .setNegativeButton("Deny") { _, _ -> onResult(false) }
+            .setOnCancelListener { onResult(false) }
+            .show()
+    }
+
     private fun showEnrollDialog(label: String, alg: String, deviceName: String?, onResult: (Boolean) -> Unit) {
         val message = buildString {
             append("Allow generating a new $alg key?\n\nLabel: $label")

@@ -13,6 +13,8 @@ object AgentMessageType {
     const val SK_ENROLL_RESPONSE: Byte = 104
     const val SK_SIGN_REQUEST: Byte    = 105
     const val SK_SIGN_RESPONSE: Byte   = 106
+    const val SK_LOAD_RESIDENT_REQUEST: Byte  = 107
+    const val SK_LOAD_RESIDENT_RESPONSE: Byte = 108
 
     /**
      * Highest session protocol version this app speaks. Bumped only when the

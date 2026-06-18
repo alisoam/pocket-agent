@@ -32,6 +32,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -42,6 +43,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -148,6 +150,7 @@ class MainActivity : FragmentActivity() {
         biometricCallback?.resumePendingEnroll()
         termuxBiometricCallback?.resumePendingSign()
         termuxBiometricCallback?.resumePendingEnroll()
+        termuxBiometricCallback?.resumePendingResidentAccess()
     }
 
     override fun onDestroy() {
@@ -182,6 +185,7 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
     var showDialog by remember { mutableStateOf(false) }
     var labelInput by remember { mutableStateOf("") }
     var selectedAlg by remember { mutableStateOf("ed25519") }
+    var isResident by remember { mutableStateOf(false) }
 
     val keysVersion by KeyManager.keysVersion.collectAsState()
     LaunchedEffect(keysVersion) {
@@ -247,10 +251,11 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
                     onClick = {
                         val label = labelInput.trim()
                         if (label.isNotEmpty()) {
-                            keyManager.generateKey(label, isEcdsa = selectedAlg == "ecdsa")
+                            keyManager.generateKey(label, isEcdsa = selectedAlg == "ecdsa", resident = isResident)
                             keys = keyManager.listKeys()
                             labelInput = ""
                             selectedAlg = "ed25519"
+                            isResident = false
                             showDialog = false
                         }
                     }
@@ -284,6 +289,14 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
                             }
                         }
                     }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(text = "Resident key")
+                        Switch(checked = isResident, onCheckedChange = { isResident = it })
+                    }
                 }
             }
         )
@@ -312,7 +325,7 @@ private fun KeyRow(key: KeyMetadata, keyManager: KeyManager, onDelete: () -> Uni
         Text(text = key.label, style = MaterialTheme.typography.titleMedium)
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = "$keyType · ${if (key.hardwareBacked) "Hardware-backed" else "Software-backed"}",
+            text = "$keyType · ${if (key.hardwareBacked) "Hardware-backed" else "Software-backed"} · ${if (key.resident) "Resident" else "Non-Resident"}",
             style = MaterialTheme.typography.bodySmall
         )
         Spacer(modifier = Modifier.height(8.dp))
@@ -346,7 +359,7 @@ private fun KeyRow(key: KeyMetadata, keyManager: KeyManager, onDelete: () -> Uni
                     showHandle = false
                 }
             }) {
-                Text(text = "Key File")
+                Text(text = "Handle")
             }
             TextButton(onClick = {
                 renameInput = key.label

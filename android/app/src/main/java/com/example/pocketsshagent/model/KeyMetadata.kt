@@ -6,5 +6,6 @@ data class KeyMetadata(
     val createdAtEpochMs: Long,
     val lastUsedAtEpochMs: Long?,
     val hardwareBacked: Boolean,
-    val skCounter: Long = 0
+    val skCounter: Long = 0,
+    val resident: Boolean = false
 )

@@ -19,10 +19,13 @@ import java.time.Instant
 class KeyManager(private val context: Context) {
     private val store = KeyMetadataStore(context)
 
-    fun generateKey(label: String): KeyMetadata = generateKey(label, isEcdsa = false, attestationChallenge = null)
+    fun generateKey(label: String): KeyMetadata = generateKey(label, isEcdsa = false, attestationChallenge = null, resident = false)
 
     fun generateKey(label: String, isEcdsa: Boolean): KeyMetadata =
-        generateKey(label, isEcdsa, attestationChallenge = null)
+        generateKey(label, isEcdsa, attestationChallenge = null, resident = false)
+
+    fun generateKey(label: String, isEcdsa: Boolean, resident: Boolean): KeyMetadata =
+        generateKey(label, isEcdsa, attestationChallenge = null, resident = resident)
 
     /**
      * Generate a new signing key.
@@ -35,7 +38,7 @@ class KeyManager(private val context: Context) {
      * Android Keystore does not support attestation for Ed25519 keys, so the challenge is
      * silently ignored when [isEcdsa] is false.
      */
-    fun generateKey(label: String, isEcdsa: Boolean, attestationChallenge: ByteArray?): KeyMetadata {
+    fun generateKey(label: String, isEcdsa: Boolean, attestationChallenge: ByteArray?, resident: Boolean = false): KeyMetadata {
         val alias = if (isEcdsa) "ec_${Instant.now().toEpochMilli()}"
                     else "ssh_ed25519_${Instant.now().toEpochMilli()}"
 
@@ -75,7 +78,8 @@ class KeyManager(private val context: Context) {
             label = label,
             createdAtEpochMs = Instant.now().toEpochMilli(),
             lastUsedAtEpochMs = null,
-            hardwareBacked = hardwareBacked
+            hardwareBacked = hardwareBacked,
+            resident = resident
         )
         store.put(metadata)
         notifyChanged()

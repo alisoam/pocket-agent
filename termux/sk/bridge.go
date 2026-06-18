@@ -32,7 +32,7 @@ struct sk_resident_key {
 	uint32_t  alg;
 	size_t    slot;
 	char     *application;
-	void     *key;
+	struct sk_enroll_response key;
 	uint8_t   flags;
 	uint8_t  *user_id;
 	size_t    user_id_len;
@@ -260,8 +260,73 @@ func sk_load_resident_keys(
 ) C.int {
 	_ = pin
 	_ = options
-	*rks = nil
-	*nrks = 0
+
+	log.Println("[SK-TERMUX] sk_load_resident_keys")
+
+	backend := getBackend()
+	if backend == nil {
+		*rks = nil
+		*nrks = 0
+		return C.int(C.SSH_SK_ERR_DEVICE_NOT_FOUND)
+	}
+
+	keys, err := backend.LoadResidentKeys()
+	if err != nil {
+		log.Printf("[SK-TERMUX] sk_load_resident_keys: %v", err)
+		*rks = nil
+		*nrks = 0
+		return C.int(C.SSH_SK_ERR_GENERAL)
+	}
+
+	if len(keys) == 0 {
+		*rks = nil
+		*nrks = 0
+		return C.int(0)
+	}
+
+	n := len(keys)
+	ptrSize := unsafe.Sizeof((*C.struct_sk_resident_key)(nil))
+	arr := (**C.struct_sk_resident_key)(C.calloc(C.size_t(n), C.size_t(ptrSize)))
+	if arr == nil {
+		return C.int(C.SSH_SK_ERR_GENERAL)
+	}
+
+	for i, k := range keys {
+		rk := (*C.struct_sk_resident_key)(C.calloc(1, C.size_t(C.sizeof_struct_sk_resident_key)))
+		if rk == nil {
+			return C.int(C.SSH_SK_ERR_GENERAL)
+		}
+
+		rk.alg = C.uint32_t(k.Alg)
+		rk.slot = 0
+		rk.application = C.CString(k.App)
+		rk.flags = C.uint8_t(k.Flags)
+		rk.user_id = nil
+		rk.user_id_len = 0
+
+		rk.key.flags = C.uint8_t(k.Flags)
+		rk.key.public_key = (*C.uint8_t)(C.malloc(C.size_t(len(k.PubKey))))
+		rk.key.public_key_len = C.size_t(len(k.PubKey))
+		C.memcpy(unsafe.Pointer(rk.key.public_key), unsafe.Pointer(&k.PubKey[0]), C.size_t(len(k.PubKey)))
+		rk.key.key_handle = (*C.uint8_t)(C.malloc(C.size_t(len(k.Handle))))
+		rk.key.key_handle_len = C.size_t(len(k.Handle))
+		C.memcpy(unsafe.Pointer(rk.key.key_handle), unsafe.Pointer(&k.Handle[0]), C.size_t(len(k.Handle)))
+		rk.key.signature = nil
+		rk.key.signature_len = 0
+		rk.key.attestation_cert = nil
+		rk.key.attestation_cert_len = 0
+		rk.key.authdata = nil
+		rk.key.authdata_len = 0
+
+		elemPtr := (**C.struct_sk_resident_key)(unsafe.Pointer(
+			uintptr(unsafe.Pointer(arr)) + uintptr(i)*ptrSize,
+		))
+		*elemPtr = rk
+	}
+
+	*rks = arr
+	*nrks = C.size_t(n)
+	log.Printf("[SK-TERMUX] sk_load_resident_keys: returning %d keys", n)
 	return C.int(0)
 }
 
@@ -325,13 +390,37 @@ func sk_free_sign_response(r *C.struct_sk_sign_response) {
 
 //export sk_free_resident_key
 func sk_free_resident_key(k *C.struct_sk_resident_key) {
-	_ = k
+	if k == nil {
+		return
+	}
+	if k.application != nil {
+		C.free(unsafe.Pointer(k.application))
+	}
+	if k.key.public_key != nil {
+		C.free(unsafe.Pointer(k.key.public_key))
+	}
+	if k.key.key_handle != nil {
+		C.free(unsafe.Pointer(k.key.key_handle))
+	}
+	if k.user_id != nil {
+		C.free(unsafe.Pointer(k.user_id))
+	}
+	C.free(unsafe.Pointer(k))
 }
 
 //export sk_free_resident_keys
 func sk_free_resident_keys(rks **C.struct_sk_resident_key, nrks C.size_t) {
-	_ = rks
-	_ = nrks
+	if rks == nil {
+		return
+	}
+	ptrSize := unsafe.Sizeof((*C.struct_sk_resident_key)(nil))
+	for i := 0; i < int(nrks); i++ {
+		elemPtr := *(**C.struct_sk_resident_key)(unsafe.Pointer(
+			uintptr(unsafe.Pointer(rks)) + uintptr(i)*ptrSize,
+		))
+		sk_free_resident_key(elemPtr)
+	}
+	C.free(unsafe.Pointer(rks))
 }
 
 func main() {}
