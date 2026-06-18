@@ -25,12 +25,14 @@ Authentication works the same way: the provider sends the signing input to the p
 ```
 PocketKey/
 ├── android/   Android app (Kotlin/Compose) — key management, BLE GATT server, biometric signing
-└── proxy/     Linux desktop proxy (Go + C) — BLE client, OpenSSH SK provider
-    ├── cmd/pocket-agent/   CLI for pairing, diagnostics, and attestation verification
-    ├── internal/
-    │   ├── ble/            BLE GATT client with auto-reconnect and encrypted transport
-    │   └── pairing/        Ed25519 device key management and QR code generation
-    └── sk/                 libpocket-sk.so — OpenSSH SecurityKeyProvider shared library
+├── proxy/     Linux desktop proxy (Go + C) — BLE client, OpenSSH SK provider
+│   ├── cmd/pocket-agent/   CLI for pairing, diagnostics, and attestation verification
+│   ├── internal/
+│   │   ├── ble/            BLE GATT client with auto-reconnect and encrypted transport
+│   │   └── pairing/        Ed25519 device key management and QR code generation
+│   └── sk/                 libpocket-sk.so — OpenSSH SecurityKeyProvider shared library
+└── termux/    On-device Termux proxy (Go) — SK provider via Android broadcast IPC
+    └── sk/                 libpocket-sk.so — SecurityKeyProvider for Termux (no BLE needed)
 ```
 
 ## Android app
@@ -231,6 +233,80 @@ To verify the challenge matches what ssh-keygen sent:
 ```
 
 Generated automatically on first `pair` run.
+
+## Termux (on-device)
+
+Use PocketKey directly from Termux on the same phone — no desktop or BLE needed. The SK provider communicates with the PocketKey app via Android's ordered broadcast IPC.
+
+### Requirements
+
+- PocketKey app installed
+- Termux with Go and OpenSSH: `pkg install golang openssh`
+
+### Build
+
+```bash
+cd termux/sk
+make
+# produces libpocket-sk.so
+```
+
+### Creating an SSH key
+
+```bash
+ssh-keygen -t ed25519-sk -w ./libpocket-sk.so
+```
+
+The PocketKey app will show an **Allow / Deny** dialog. Tap **Allow** to generate the key.
+
+For ECDSA:
+
+```bash
+ssh-keygen -t ecdsa-sk -w ./libpocket-sk.so
+```
+
+### Using the key
+
+```bash
+ssh -i ~/.ssh/id_ed25519_sk -o SecurityKeyProvider=./libpocket-sk.so user@server
+```
+
+Or in `~/.ssh/config`:
+
+```
+Host myserver
+    HostName server.example.com
+    User myuser
+    IdentityFile ~/.ssh/id_ed25519_sk
+    SecurityKeyProvider /data/data/com.termux/files/home/termux/sk/libpocket-sk.so
+```
+
+### Using with ssh-agent
+
+OpenSSH requires explicitly allowing custom SK providers with the `-P` flag:
+
+```bash
+eval $(ssh-agent -P /path/to/libpocket-sk.so)
+ssh-add -S /path/to/libpocket-sk.so ~/.ssh/id_ed25519_sk
+ssh-add -l
+# 256 SHA256:... (ED25519-SK)
+
+ssh user@server   # no extra flags needed, biometric prompt appears on screen
+```
+
+To persist across sessions, add to `~/.bashrc` or `~/.zshrc`:
+
+```bash
+if [ -z "$SSH_AUTH_SOCK" ]; then
+    eval $(ssh-agent -P /path/to/libpocket-sk.so)
+fi
+ssh-add -S /path/to/libpocket-sk.so ~/.ssh/id_ed25519_sk 2>/dev/null
+```
+
+### Notes
+
+- The PocketKey app must be open for biometric and enrollment prompts to appear.
+- No root, ADB, or Shizuku required — the provider uses `am broadcast` to communicate with the app.
 
 ## Security
 
