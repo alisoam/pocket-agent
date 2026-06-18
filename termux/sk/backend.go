@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -19,67 +21,73 @@ const (
 	msgSKSignResponse   byte = 106
 	msgFailure          byte = 5
 
-	contentAuthority = "content://com.example.pocketsshagent.agent"
-	signTimeout      = 90 * time.Second
-	defaultTimeout   = 15 * time.Second
+	broadcastAction = "com.example.pocketsshagent.HANDLE_MESSAGE"
+	signTimeout     = 90 * time.Second
+	defaultTimeout  = 15 * time.Second
 )
 
-type ContentBackend struct{}
+type BroadcastBackend struct{}
 
-var globalBackend = &ContentBackend{}
+var globalBackend = &BroadcastBackend{}
 
-func getBackend() *ContentBackend {
+func getBackend() *BroadcastBackend {
 	return globalBackend
 }
 
-func (b *ContentBackend) SendMessage(msg []byte, timeout time.Duration) ([]byte, error) {
+func (b *BroadcastBackend) SendMessage(msg []byte, timeout time.Duration) ([]byte, error) {
 	requestB64 := base64.StdEncoding.EncodeToString(msg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "/system/bin/content", "call",
-		"--uri", contentAuthority,
-		"--method", "handleMessage",
-		"--arg", requestB64)
+	cmd := exec.CommandContext(ctx, "/system/bin/am", "broadcast",
+		"--user", "0",
+		"-n", "com.example.pocketsshagent/.termux.AgentReceiver",
+		"--es", "msg", requestB64)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
 	out, err := cmd.Output()
+	if stderrStr := stderr.String(); stderrStr != "" {
+		log.Printf("[SK-TERMUX] am broadcast stderr: %s", stderrStr)
+	}
+	log.Printf("[SK-TERMUX] am broadcast stdout: %q (err=%v)", string(out), err)
 	if err != nil {
-		return nil, fmt.Errorf("content call: %w", err)
+		return nil, fmt.Errorf("am broadcast: %w", err)
 	}
 
-	responseB64, err := parseContentCallOutput(string(out))
+	responseB64, err := parseBroadcastOutput(string(out))
 	if err != nil {
 		return nil, err
 	}
 
-	return base64.StdEncoding.DecodeString(responseB64)
+	framed, err := base64.StdEncoding.DecodeString(responseB64)
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode: %w", err)
+	}
+	if len(framed) < 4 {
+		return nil, fmt.Errorf("response too short (%d bytes)", len(framed))
+	}
+	return framed[4:], nil
 }
 
-func parseContentCallOutput(output string) (string, error) {
+var broadcastDataRe = regexp.MustCompile(`data="([A-Za-z0-9+/=]+)"`)
+
+func parseBroadcastOutput(output string) (string, error) {
 	output = strings.TrimSpace(output)
-	prefix := "Result: Bundle[{"
-	if !strings.HasPrefix(output, prefix) {
-		return "", fmt.Errorf("unexpected content call output: %s", output)
+	if strings.Contains(output, "without waiting") {
+		return "", fmt.Errorf("broadcast sent async, ordered broadcast required: %s", output)
 	}
 
-	inner := output[len(prefix):]
-	idx := strings.Index(inner, "}]")
-	if idx < 0 {
-		return "", fmt.Errorf("malformed content call output: %s", output)
+	m := broadcastDataRe.FindStringSubmatch(output)
+	if m == nil {
+		return "", fmt.Errorf("no result data in broadcast output: %s", output)
 	}
-	inner = inner[:idx]
-
-	for _, pair := range strings.Split(inner, ", ") {
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) == 2 && parts[0] == "r" {
-			return parts[1], nil
-		}
-	}
-	return "", fmt.Errorf("no 'r' key in content call output: %s", output)
+	return m[1], nil
 }
 
-func (b *ContentBackend) Enroll(application string, alg uint32, flags byte, label string, challenge []byte) (pubkey, keyHandle []byte, actualAlg uint32, attestationChain [][]byte, err error) {
+func (b *BroadcastBackend) Enroll(application string, alg uint32, flags byte, label string, challenge []byte) (pubkey, keyHandle []byte, actualAlg uint32, attestationChain [][]byte, err error) {
 	appHash := sha256.Sum256([]byte(application))
 	labelBytes := []byte(label)
 
@@ -165,7 +173,7 @@ func (b *ContentBackend) Enroll(application string, alg uint32, flags byte, labe
 	return pubkey, keyHandle, actualAlg, attestationChain, nil
 }
 
-func (b *ContentBackend) Sign(alg uint32, application string, keyHandle, data []byte, flags byte) (sigR, sigS []byte, counter uint32, respFlags byte, err error) {
+func (b *BroadcastBackend) Sign(alg uint32, application string, keyHandle, data []byte, flags byte) (sigR, sigS []byte, counter uint32, respFlags byte, err error) {
 	appHash := sha256.Sum256([]byte(application))
 	dataHash := sha256.Sum256(data)
 
