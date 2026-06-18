@@ -49,40 +49,6 @@ class SshWireFormatTest {
     }
 
     @Test
-    fun `encodeEd25519PublicKey structure`() {
-        val fakeKey = ByteArray(32) { it.toByte() }
-        val blob = SshWireFormat.encodeEd25519PublicKey(fakeKey)
-
-        // Should be: string("ssh-ed25519") + string(32-byte key)
-        // = (4 + 11) + (4 + 32) = 51 bytes
-        assertEquals(51, blob.size)
-
-        val (keyType, offset1) = SshWireFormat.decodeString(blob, 0)
-        assertEquals("ssh-ed25519", String(keyType, Charsets.UTF_8))
-
-        val (keyData, offset2) = SshWireFormat.decodeString(blob, offset1)
-        assertEquals(32, keyData.size)
-        assertArrayEquals(fakeKey, keyData)
-        assertEquals(51, offset2)
-    }
-
-    @Test
-    fun `encodeEd25519Signature structure`() {
-        val fakeSig = ByteArray(64) { (it + 100).toByte() }
-        val blob = SshWireFormat.encodeEd25519Signature(fakeSig)
-
-        // string("ssh-ed25519") + string(64-byte sig)
-        // = (4 + 11) + (4 + 64) = 83 bytes
-        assertEquals(83, blob.size)
-
-        val (sigType, offset1) = SshWireFormat.decodeString(blob, 0)
-        assertEquals("ssh-ed25519", String(sigType, Charsets.UTF_8))
-
-        val (sigData, _) = SshWireFormat.decodeString(blob, offset1)
-        assertArrayEquals(fakeSig, sigData)
-    }
-
-    @Test
     fun `frameMessage adds length prefix`() {
         val msg = byteArrayOf(11) // REQUEST_IDENTITIES
         val framed = SshWireFormat.frameMessage(msg)
@@ -93,7 +59,6 @@ class SshWireFormatTest {
 
     @Test
     fun `extractRawEd25519PublicKey from X509`() {
-        // Construct a valid X.509 Ed25519 SubjectPublicKeyInfo (44 bytes)
         val header = byteArrayOf(
             0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65,
             0x70, 0x03, 0x21, 0x00
@@ -108,5 +73,36 @@ class SshWireFormatTest {
     @Test(expected = IllegalArgumentException::class)
     fun `extractRawEd25519PublicKey rejects wrong size`() {
         SshWireFormat.extractRawEd25519PublicKey(ByteArray(30))
+    }
+
+    @Test
+    fun `extractRawP256PublicKey from encoded`() {
+        val point = ByteArray(65) { it.toByte() }
+        point[0] = 0x04
+        val header = byteArrayOf(0x30, 0x59, 0x30, 0x13)
+        val encoded = header + point
+
+        val extracted = SshWireFormat.extractRawP256PublicKey(encoded)
+        assertArrayEquals(point, extracted)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `extractRawP256PublicKey rejects short input`() {
+        SshWireFormat.extractRawP256PublicKey(ByteArray(30))
+    }
+
+    @Test
+    fun `extractRawEcdsaComponents from DER`() {
+        val r = ByteArray(32) { (it + 1).toByte() }
+        val s = ByteArray(32) { (it + 33).toByte() }
+
+        val der = byteArrayOf(
+            0x30, 68,
+            0x02, 32
+        ) + r + byteArrayOf(0x02, 32) + s
+
+        val (extractedR, extractedS) = SshWireFormat.extractRawEcdsaComponents(der)
+        assertArrayEquals(r, extractedR)
+        assertArrayEquals(s, extractedS)
     }
 }

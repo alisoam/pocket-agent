@@ -6,54 +6,6 @@ import org.junit.Test
 class AgentMessageTest {
 
     @Test
-    fun `identitiesAnswer with no keys`() {
-        val response = AgentMessageBuilder.identitiesAnswer(emptyList())
-        assertEquals(AgentMessageType.SSH_AGENT_IDENTITIES_ANSWER, response[0])
-        // nkeys = 0
-        assertEquals(0, SshWireFormat.decodeUint32(response, 1))
-        assertEquals(5, response.size) // 1 type + 4 nkeys
-    }
-
-    @Test
-    fun `identitiesAnswer with one key`() {
-        val fakeBlob = ByteArray(51) { it.toByte() }
-        val comment = "test-key"
-        val response = AgentMessageBuilder.identitiesAnswer(listOf(fakeBlob to comment))
-
-        assertEquals(AgentMessageType.SSH_AGENT_IDENTITIES_ANSWER, response[0])
-        assertEquals(1, SshWireFormat.decodeUint32(response, 1))
-
-        // After type(1) + nkeys(4), read key blob string
-        val (blob, offset1) = SshWireFormat.decodeString(response, 5)
-        assertArrayEquals(fakeBlob, blob)
-
-        // Read comment string
-        val (commentBytes, _) = SshWireFormat.decodeString(response, offset1)
-        assertEquals(comment, String(commentBytes, Charsets.UTF_8))
-    }
-
-    @Test
-    fun `signResponse structure`() {
-        val fakeSig = ByteArray(64) { it.toByte() }
-        val response = AgentMessageBuilder.signResponse(fakeSig)
-
-        assertEquals(AgentMessageType.SSH_AGENT_SIGN_RESPONSE, response[0])
-
-        // After type byte, there's a string wrapping the encoded signature
-        val (outerSig, _) = SshWireFormat.decodeString(response, 1)
-
-        // outerSig should be encodeEd25519Signature(fakeSig) = 83 bytes
-        assertEquals(83, outerSig.size)
-
-        // Parse the inner structure
-        val (sigType, off1) = SshWireFormat.decodeString(outerSig, 0)
-        assertEquals("ssh-ed25519", String(sigType, Charsets.UTF_8))
-
-        val (sigData, _) = SshWireFormat.decodeString(outerSig, off1)
-        assertArrayEquals(fakeSig, sigData)
-    }
-
-    @Test
     fun `failure response`() {
         val response = AgentMessageBuilder.failure()
         assertEquals(1, response.size)
@@ -61,31 +13,147 @@ class AgentMessageTest {
     }
 
     @Test
-    fun `parseSignRequest round-trip`() {
-        // Build a sign request manually
-        val keyBlob = ByteArray(51) { (it + 10).toByte() }
-        val data = "test data to sign".toByteArray()
-        val flags = 0
+    fun `authFailure response`() {
+        val response = AgentMessageBuilder.authFailure()
+        assertEquals(1, response.size)
+        assertEquals(AgentMessageType.POCKET_AUTH_FAILURE, response[0])
+    }
 
-        val message = byteArrayOf(AgentMessageType.SSH_AGENTC_SIGN_REQUEST) +
-                SshWireFormat.encodeString(keyBlob) +
-                SshWireFormat.encodeString(data) +
-                SshWireFormat.encodeUint32(flags)
+    @Test
+    fun `authSuccess response structure`() {
+        val ephemeralPub = ByteArray(32) { it.toByte() }
+        val version = 1
+        val response = AgentMessageBuilder.authSuccess(ephemeralPub, version)
 
-        val parsed = AgentMessageParser.parseSignRequest(message)
-        assertArrayEquals(keyBlob, parsed.keyBlob)
-        assertArrayEquals(data, parsed.data)
-        assertEquals(0, parsed.flags)
+        assertEquals(AgentMessageType.POCKET_AUTH_SUCCESS, response[0])
+
+        val (pubKey, offset) = SshWireFormat.decodeString(response, 1)
+        assertArrayEquals(ephemeralPub, pubKey)
+
+        assertEquals(version, response[offset].toInt() and 0xFF)
     }
 
     @Test
     fun `messageType extracts first byte`() {
-        val msg = byteArrayOf(AgentMessageType.SSH_AGENTC_REQUEST_IDENTITIES)
-        assertEquals(AgentMessageType.SSH_AGENTC_REQUEST_IDENTITIES, AgentMessageParser.messageType(msg))
+        val msg = byteArrayOf(AgentMessageType.POCKET_AUTH_REQUEST)
+        assertEquals(AgentMessageType.POCKET_AUTH_REQUEST, AgentMessageParser.messageType(msg))
     }
 
     @Test(expected = IllegalArgumentException::class)
-    fun `parseSignRequest rejects wrong type`() {
-        AgentMessageParser.parseSignRequest(byteArrayOf(AgentMessageType.SSH_AGENTC_REQUEST_IDENTITIES))
+    fun `messageType rejects empty message`() {
+        AgentMessageParser.messageType(byteArrayOf())
+    }
+
+    @Test
+    fun `parseAuthRequest round-trip`() {
+        val publicKey = ByteArray(44) { it.toByte() }
+        val nonce = ByteArray(32) { (it + 50).toByte() }
+        val signature = ByteArray(64) { (it + 100).toByte() }
+        val x25519Key = ByteArray(32) { (it + 200).toByte() }
+        val clientVersion = 1
+
+        val message = byteArrayOf(AgentMessageType.POCKET_AUTH_REQUEST) +
+                SshWireFormat.encodeString(publicKey) +
+                SshWireFormat.encodeString(nonce) +
+                SshWireFormat.encodeString(signature) +
+                SshWireFormat.encodeString(x25519Key) +
+                byteArrayOf(clientVersion.toByte())
+
+        val parsed = AgentMessageParser.parseAuthRequest(message)
+        assertArrayEquals(publicKey, parsed.publicKey)
+        assertArrayEquals(nonce, parsed.nonce)
+        assertArrayEquals(signature, parsed.signature)
+        assertArrayEquals(x25519Key, parsed.x25519EphemeralKey)
+        assertEquals(clientVersion, parsed.clientVersion)
+    }
+
+    @Test
+    fun `parseAuthRequest defaults version to 1 when omitted`() {
+        val publicKey = ByteArray(44) { it.toByte() }
+        val nonce = ByteArray(32) { (it + 50).toByte() }
+        val signature = ByteArray(64) { (it + 100).toByte() }
+        val x25519Key = ByteArray(32) { (it + 200).toByte() }
+
+        val message = byteArrayOf(AgentMessageType.POCKET_AUTH_REQUEST) +
+                SshWireFormat.encodeString(publicKey) +
+                SshWireFormat.encodeString(nonce) +
+                SshWireFormat.encodeString(signature) +
+                SshWireFormat.encodeString(x25519Key)
+
+        val parsed = AgentMessageParser.parseAuthRequest(message)
+        assertEquals(1, parsed.clientVersion)
+    }
+
+    @Test
+    fun `parseSkEnrollRequest basic`() {
+        val appHash = ByteArray(32) { it.toByte() }
+        val alg: Byte = 1
+        val flags: Byte = 0x01
+
+        val message = ByteArray(35)
+        message[0] = AgentMessageType.SK_ENROLL_REQUEST
+        message[1] = alg
+        System.arraycopy(appHash, 0, message, 2, 32)
+        message[34] = flags
+
+        val parsed = AgentMessageParser.parseSkEnrollRequest(message)
+        assertEquals(1, parsed.alg)
+        assertArrayEquals(appHash, parsed.appHash)
+        assertEquals(flags, parsed.flags)
+        assertEquals("", parsed.label)
+    }
+
+    @Test
+    fun `parseSkEnrollRequest with label`() {
+        val appHash = ByteArray(32) { it.toByte() }
+        val label = "test-key"
+        val labelBytes = label.toByteArray(Charsets.UTF_8)
+
+        val message = ByteArray(35 + 2 + labelBytes.size)
+        message[0] = AgentMessageType.SK_ENROLL_REQUEST
+        message[1] = 0
+        System.arraycopy(appHash, 0, message, 2, 32)
+        message[34] = 0x01
+        message[35] = (labelBytes.size shr 8).toByte()
+        message[36] = (labelBytes.size and 0xFF).toByte()
+        System.arraycopy(labelBytes, 0, message, 37, labelBytes.size)
+
+        val parsed = AgentMessageParser.parseSkEnrollRequest(message)
+        assertEquals(label, parsed.label)
+    }
+
+    @Test
+    fun `parseSkSignRequest round-trip`() {
+        val handle = "sk-key-alias"
+        val handleBytes = handle.toByteArray(Charsets.UTF_8)
+        val appHash = ByteArray(32) { it.toByte() }
+        val flags: Byte = 0x01
+        val dataHash = ByteArray(32) { (it + 64).toByte() }
+
+        val message = ByteArray(1 + 2 + handleBytes.size + 32 + 1 + 32)
+        var off = 0
+        message[off++] = AgentMessageType.SK_SIGN_REQUEST
+        message[off++] = (handleBytes.size shr 8).toByte()
+        message[off++] = (handleBytes.size and 0xFF).toByte()
+        System.arraycopy(handleBytes, 0, message, off, handleBytes.size); off += handleBytes.size
+        System.arraycopy(appHash, 0, message, off, 32); off += 32
+        message[off++] = flags
+        System.arraycopy(dataHash, 0, message, off, 32)
+
+        val parsed = AgentMessageParser.parseSkSignRequest(message)
+        assertEquals(handle, parsed.handle)
+        assertArrayEquals(appHash, parsed.appHash)
+        assertEquals(flags, parsed.flags)
+        assertArrayEquals(dataHash, parsed.dataHash)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `parseSkEnrollRequest rejects wrong type`() {
+        AgentMessageParser.parseSkEnrollRequest(byteArrayOf(AgentMessageType.SSH_AGENT_FAILURE))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `parseSkSignRequest rejects wrong type`() {
+        AgentMessageParser.parseSkSignRequest(byteArrayOf(AgentMessageType.SSH_AGENT_FAILURE))
     }
 }
