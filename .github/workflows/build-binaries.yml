@@ -103,17 +103,14 @@ jobs:
         with:
           go-version-file: termux/sk/go.mod
 
-      - name: Set up Android NDK
-        uses: android-actions/setup-android@v3
-
       - name: Build Termux SK provider
         working-directory: termux/sk
-        env:
-          GOOS: android
-          GOARCH: arm64
-          CGO_ENABLED: 1
-          CC: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
         run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          export CC=$(ls "${NDK}"/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang 2>/dev/null | grep -v '++' | sort -V | tail -1)
+          if [ -z "$CC" ]; then echo "ERROR: NDK clang not found"; exit 1; fi
+          echo "Using CC=$CC"
+          export GOOS=android GOARCH=arm64 CGO_ENABLED=1
           go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o libpocket-sk.so .
 
       - name: Package artifact
