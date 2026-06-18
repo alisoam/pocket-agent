@@ -55,6 +55,7 @@ import androidx.fragment.app.FragmentActivity
 import com.example.pocketsshagent.agent.SshPublicKeyUtils
 import com.example.pocketsshagent.ble.BleAgentService
 import com.example.pocketsshagent.crypto.BiometricAgentCallback
+import com.example.pocketsshagent.data.SettingsStore
 import com.example.pocketsshagent.crypto.KeyManager
 import com.example.pocketsshagent.model.KeyMetadata
 import com.example.pocketsshagent.pairing.PairingScreen
@@ -116,7 +117,7 @@ class MainActivity : FragmentActivity() {
     ) { results ->
         val allGranted = results.values.all { it }
         if (allGranted) {
-            startBleService()
+            startServices()
         } else {
             Toast.makeText(this, "Bluetooth permissions required for SSH agent", Toast.LENGTH_LONG).show()
         }
@@ -128,7 +129,7 @@ class MainActivity : FragmentActivity() {
 
         // Request permissions then start service
         if (hasRequiredPermissions()) {
-            startBleService()
+            startServices()
         } else {
             permissionLauncher.launch(requiredPermissions)
         }
@@ -137,8 +138,16 @@ class MainActivity : FragmentActivity() {
             PocketSSHAgentTheme {
                 var currentScreen by remember { mutableStateOf("keys") }
                 when (currentScreen) {
-                    "keys" -> KeyListScreen(onNavigateToPairing = { currentScreen = "pairing" })
+                    "keys" -> KeyListScreen(
+                        onNavigateToPairing = { currentScreen = "pairing" },
+                        onNavigateToSettings = { currentScreen = "settings" }
+                    )
                     "pairing" -> PairingScreen(onBack = { currentScreen = "keys" })
+                    "settings" -> SettingsScreen(
+                        onBack = { currentScreen = "keys" },
+                        onBleToggled = { enabled -> toggleBleService(enabled) },
+                        onTermuxToggled = { enabled -> toggleTermuxService(enabled) }
+                    )
                 }
             }
         }
@@ -163,11 +172,43 @@ class MainActivity : FragmentActivity() {
         super.onDestroy()
     }
 
-    private fun startBleService() {
-        val serviceIntent = Intent(this, BleAgentService::class.java)
-        startForegroundService(serviceIntent)
-        bindService(serviceIntent, serviceConnection, BIND_AUTO_CREATE)
-        bindService(Intent(this, TermuxAgentService::class.java), termuxServiceConnection, BIND_AUTO_CREATE)
+    private fun startServices() {
+        val settings = SettingsStore(this)
+        if (settings.bleEnabled) {
+            val serviceIntent = Intent(this, BleAgentService::class.java)
+            startForegroundService(serviceIntent)
+            bindService(serviceIntent, serviceConnection, BIND_AUTO_CREATE)
+        }
+        if (settings.termuxEnabled) {
+            bindService(Intent(this, TermuxAgentService::class.java), termuxServiceConnection, BIND_AUTO_CREATE)
+        }
+    }
+
+    private fun toggleBleService(enabled: Boolean) {
+        if (enabled) {
+            val serviceIntent = Intent(this, BleAgentService::class.java)
+            startForegroundService(serviceIntent)
+            bindService(serviceIntent, serviceConnection, BIND_AUTO_CREATE)
+        } else {
+            if (bleService != null) {
+                unbindService(serviceConnection)
+                bleService = null
+                biometricCallback = null
+            }
+            stopService(Intent(this, BleAgentService::class.java))
+        }
+    }
+
+    private fun toggleTermuxService(enabled: Boolean) {
+        if (enabled) {
+            bindService(Intent(this, TermuxAgentService::class.java), termuxServiceConnection, BIND_AUTO_CREATE)
+        } else {
+            if (termuxService != null) {
+                unbindService(termuxServiceConnection)
+                termuxService = null
+                termuxBiometricCallback = null
+            }
+        }
     }
 
     private fun hasRequiredPermissions(): Boolean {
@@ -178,7 +219,7 @@ class MainActivity : FragmentActivity() {
 }
 
 @Composable
-fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
+fun KeyListScreen(onNavigateToPairing: () -> Unit = {}, onNavigateToSettings: () -> Unit = {}) {
     val context = LocalContext.current.applicationContext
     val keyManager = remember { KeyManager(context) }
     var keys by remember { mutableStateOf(emptyList<KeyMetadata>()) }
@@ -216,8 +257,13 @@ fun KeyListScreen(onNavigateToPairing: () -> Unit = {}) {
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.SemiBold
                 )
-                TextButton(onClick = onNavigateToPairing) {
-                    Text("Devices")
+                Row {
+                    TextButton(onClick = onNavigateToSettings) {
+                        Text("Settings")
+                    }
+                    TextButton(onClick = onNavigateToPairing) {
+                        Text("Devices")
+                    }
                 }
             }
             Spacer(modifier = Modifier.height(12.dp))

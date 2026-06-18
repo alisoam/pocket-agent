@@ -8,6 +8,7 @@ import android.util.Base64
 import android.util.Log
 import com.example.pocketsshagent.agent.AgentCallback
 import com.example.pocketsshagent.agent.AgentMessageBuilder
+import com.example.pocketsshagent.data.SettingsStore
 import com.example.pocketsshagent.agent.SshAgentHandler
 import com.example.pocketsshagent.agent.SshWireFormat
 import com.example.pocketsshagent.crypto.KeyManager
@@ -24,6 +25,12 @@ class AgentReceiver : BroadcastReceiver() {
     }
 
     override fun onReceive(context: Context, intent: Intent) {
+        if (!SettingsStore(context.applicationContext).termuxEnabled) {
+            Log.i(TAG, "Termux service disabled, rejecting request")
+            resultCode = Activity.RESULT_CANCELED
+            return
+        }
+
         val msgB64 = intent.getStringExtra("msg")
         if (msgB64 == null) {
             resultCode = Activity.RESULT_CANCELED
