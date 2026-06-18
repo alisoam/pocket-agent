@@ -25,7 +25,7 @@ jobs:
 
       - name: Build APK
         working-directory: android
-        run: ./gradlew assembleRelease
+        run: ./gradlew assembleDebug
 
       - name: Derive version
         id: vars
@@ -38,8 +38,7 @@ jobs:
         run: |
           version="${{ steps.vars.outputs.version }}"
           mkdir -p dist
-          cp android/app/build/outputs/apk/release/*.apk "dist/pocket-ssh-agent_${version}.apk" 2>/dev/null || \
-          cp android/app/build/outputs/apk/debug/*.apk "dist/pocket-ssh-agent_${version}.apk" 2>/dev/null || true
+          cp android/app/build/outputs/apk/debug/*.apk "dist/pocket-ssh-agent_${version}.apk"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
