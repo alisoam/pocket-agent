@@ -13,6 +13,7 @@ import android.widget.Toast
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -135,7 +136,14 @@ class MainActivity : FragmentActivity() {
         }
 
         setContent {
-            PocketSSHAgentTheme {
+            val settingsStore = remember { SettingsStore(this) }
+            var themeMode by remember { mutableStateOf(settingsStore.themeMode) }
+            val darkTheme = when (themeMode) {
+                SettingsStore.THEME_DARK -> true
+                SettingsStore.THEME_LIGHT -> false
+                else -> isSystemInDarkTheme()
+            }
+            PocketSSHAgentTheme(darkTheme = darkTheme) {
                 var currentScreen by remember { mutableStateOf("keys") }
                 when (currentScreen) {
                     "keys" -> KeyListScreen(
@@ -146,7 +154,8 @@ class MainActivity : FragmentActivity() {
                     "settings" -> SettingsScreen(
                         onBack = { currentScreen = "keys" },
                         onBleToggled = { enabled -> toggleBleService(enabled) },
-                        onTermuxToggled = { enabled -> toggleTermuxService(enabled) }
+                        onTermuxToggled = { enabled -> toggleTermuxService(enabled) },
+                        onThemeChanged = { mode -> themeMode = mode }
                     )
                 }
             }

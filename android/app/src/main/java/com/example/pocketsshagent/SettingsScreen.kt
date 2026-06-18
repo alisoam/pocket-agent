@@ -10,6 +10,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -29,79 +33,108 @@ import com.example.pocketsshagent.data.SettingsStore
 fun SettingsScreen(
     onBack: () -> Unit = {},
     onBleToggled: (Boolean) -> Unit = {},
-    onTermuxToggled: (Boolean) -> Unit = {}
+    onTermuxToggled: (Boolean) -> Unit = {},
+    onThemeChanged: (String) -> Unit = {}
 ) {
     val context = LocalContext.current.applicationContext
     val settingsStore = remember { SettingsStore(context) }
     var bleEnabled by remember { mutableStateOf(settingsStore.bleEnabled) }
     var termuxEnabled by remember { mutableStateOf(settingsStore.termuxEnabled) }
+    var themeMode by remember { mutableStateOf(settingsStore.themeMode) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "Settings",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold
-            )
-            TextButton(onClick = onBack) {
-                Text("Back")
-            }
-        }
-        Spacer(modifier = Modifier.height(16.dp))
+    val themeModes = listOf(SettingsStore.THEME_SYSTEM, SettingsStore.THEME_LIGHT, SettingsStore.THEME_DARK)
+    val themeLabels = listOf("System", "Light", "Dark")
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+    Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(16.dp)
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(text = "BLE Service", style = MaterialTheme.typography.titleMedium)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
-                    text = "Allow desktop connections over Bluetooth",
-                    style = MaterialTheme.typography.bodySmall
+                    text = "Settings",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                TextButton(onClick = onBack) {
+                    Text("Back")
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text(text = "Theme", style = MaterialTheme.typography.titleMedium)
+            Spacer(modifier = Modifier.height(8.dp))
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                themeModes.forEachIndexed { index, mode ->
+                    SegmentedButton(
+                        selected = themeMode == mode,
+                        onClick = {
+                            themeMode = mode
+                            settingsStore.themeMode = mode
+                            onThemeChanged(mode)
+                        },
+                        shape = SegmentedButtonDefaults.itemShape(index, themeModes.size)
+                    ) {
+                        Text(text = themeLabels[index])
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = "BLE Service", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        text = "Allow desktop connections over Bluetooth",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Switch(
+                    checked = bleEnabled,
+                    onCheckedChange = {
+                        bleEnabled = it
+                        settingsStore.bleEnabled = it
+                        onBleToggled(it)
+                    }
                 )
             }
-            Switch(
-                checked = bleEnabled,
-                onCheckedChange = {
-                    bleEnabled = it
-                    settingsStore.bleEnabled = it
-                    onBleToggled(it)
-                }
-            )
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        HorizontalDivider()
-        Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(8.dp))
+            HorizontalDivider()
+            Spacer(modifier = Modifier.height(8.dp))
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(text = "Termux Service", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    text = "Allow Termux to use SSH keys on this device",
-                    style = MaterialTheme.typography.bodySmall
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = "Termux Service", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        text = "Allow Termux to use SSH keys on this device",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Switch(
+                    checked = termuxEnabled,
+                    onCheckedChange = {
+                        termuxEnabled = it
+                        settingsStore.termuxEnabled = it
+                        onTermuxToggled(it)
+                    }
                 )
             }
-            Switch(
-                checked = termuxEnabled,
-                onCheckedChange = {
-                    termuxEnabled = it
-                    settingsStore.termuxEnabled = it
-                    onTermuxToggled(it)
-                }
-            )
         }
     }
 }
