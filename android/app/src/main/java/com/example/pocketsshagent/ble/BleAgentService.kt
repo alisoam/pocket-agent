@@ -1,5 +1,6 @@
 package com.example.pocketsshagent.ble
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -43,6 +44,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Clients (desktop proxy) connect via BLE, write agent requests to the RX characteristic,
  * and receive responses via notifications on the TX characteristic.
  */
+// BLE advertise/connect permissions are requested and enforced in MainActivity
+// before this service is ever started; lint can't see that cross-class guarantee.
+@SuppressLint("MissingPermission")
 class BleAgentService : Service() {
 
     companion object {

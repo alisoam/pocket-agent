@@ -40,26 +40,19 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
+        <!-- Local-only: bound by MainActivity for the biometric UI / notifications.
+             Not exported; the cross-app entry point is AgentContentProvider. -->
         <service
             android:name=".termux.TermuxAgentService"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="com.example.pocketsshagent.BIND_TERMUX_AGENT" />
-            </intent-filter>
-        </service>
+            android:exported="false" />
 
+        <!-- Exported so local CLI callers (Termux) can `content call`, but every
+             call is authorized by Binder.getCallingUid() against an allowlist
+             inside the provider. -->
         <provider
             android:name=".termux.AgentContentProvider"
             android:authorities="com.example.pocketsshagent.agent"
             android:exported="true" />
-
-        <receiver
-            android:name=".termux.AgentReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="com.example.pocketsshagent.HANDLE_MESSAGE" />
-            </intent-filter>
-        </receiver>
     </application>
 
 </manifest>

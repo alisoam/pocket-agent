@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -10,7 +12,6 @@ import (
 	"log"
 	"os/exec"
 	"regexp"
-	"strings"
 	"time"
 )
 
@@ -23,73 +24,134 @@ const (
 	msgSKLoadResidentResponse  byte = 108
 	msgFailure                 byte = 5
 
-	broadcastAction = "com.example.pocketsshagent.HANDLE_MESSAGE"
-	signTimeout     = 90 * time.Second
-	defaultTimeout  = 15 * time.Second
+	agentURI       = "content://com.example.pocketsshagent.agent"
+	signTimeout    = 90 * time.Second
+	defaultTimeout = 15 * time.Second
+	pollInterval   = 250 * time.Millisecond
 )
 
-type BroadcastBackend struct{}
+// ContentBackend talks to the Android app's AgentContentProvider via the
+// `content call` CLI. A request is initiated (the app authorizes the caller by
+// UID), and the encrypted result is then polled until ready. Decoupling
+// initiate from poll means a biometric prompt can take as long as the user
+// needs without holding a binder transaction open.
+type ContentBackend struct{}
 
-var globalBackend = &BroadcastBackend{}
+var globalBackend = &ContentBackend{}
 
-func getBackend() *BroadcastBackend {
+func getBackend() *ContentBackend {
 	return globalBackend
 }
 
-func (b *BroadcastBackend) SendMessage(msg []byte, timeout time.Duration) ([]byte, error) {
-	requestB64 := base64.StdEncoding.EncodeToString(msg)
+func (b *ContentBackend) SendMessage(msg []byte, timeout time.Duration) ([]byte, error) {
+	deadline := time.Now().Add(timeout)
 
+	// 1) initiate: hand over the request, receive a requestId + per-request AES key.
+	initOut, err := b.contentCall(defaultTimeout, "initiate", base64.StdEncoding.EncodeToString(msg))
+	if err != nil {
+		return nil, fmt.Errorf("initiate: %w", err)
+	}
+	if e := bundleString(initOut, "e"); e != "" {
+		return nil, fmt.Errorf("initiate rejected: %s", e)
+	}
+	requestID := bundleString(initOut, "id")
+	keyB64 := bundleString(initOut, "k")
+	if requestID == "" || keyB64 == "" {
+		return nil, fmt.Errorf("initiate: missing id/key in response: %q", initOut)
+	}
+	key, err := base64.StdEncoding.DecodeString(keyB64)
+	if err != nil {
+		return nil, fmt.Errorf("initiate: bad key: %w", err)
+	}
+
+	// 2) poll until the (possibly biometric-gated) result is ready.
+	for {
+		pollOut, err := b.contentCall(defaultTimeout, "poll", requestID)
+		if err != nil {
+			return nil, fmt.Errorf("poll: %w", err)
+		}
+		switch bundleString(pollOut, "s") {
+		case "done":
+			enc, err := base64.StdEncoding.DecodeString(bundleString(pollOut, "d"))
+			if err != nil {
+				return nil, fmt.Errorf("poll: bad result data: %w", err)
+			}
+			framed, err := decryptResponse(key, enc)
+			if err != nil {
+				return nil, err
+			}
+			if len(framed) < 4 {
+				return nil, fmt.Errorf("response too short (%d bytes)", len(framed))
+			}
+			return framed[4:], nil
+		case "pending":
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("timed out waiting for approval")
+			}
+			time.Sleep(pollInterval)
+		default:
+			return nil, fmt.Errorf("poll: unknown request (expired or denied)")
+		}
+	}
+}
+
+func (b *ContentBackend) contentCall(timeout time.Duration, method, arg string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "/system/bin/am", "broadcast",
-		"--user", "0",
-		"-n", "com.example.pocketsshagent/.termux.AgentReceiver",
-		"--es", "msg", requestB64)
+	cmd := exec.CommandContext(ctx, "/system/bin/content", "call",
+		"--uri", agentURI,
+		"--method", method,
+		"--arg", arg)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-
 	out, err := cmd.Output()
-	if stderrStr := stderr.String(); stderrStr != "" {
-		log.Printf("[SK-TERMUX] am broadcast stderr: %s", stderrStr)
+	if s := stderr.String(); s != "" {
+		log.Printf("[SK-TERMUX] content call %s stderr: %s", method, s)
 	}
-	log.Printf("[SK-TERMUX] am broadcast stdout: %q (err=%v)", string(out), err)
 	if err != nil {
-		return nil, fmt.Errorf("am broadcast: %w", err)
+		return "", fmt.Errorf("content call %s: %w", method, err)
 	}
-
-	responseB64, err := parseBroadcastOutput(string(out))
-	if err != nil {
-		return nil, err
-	}
-
-	framed, err := base64.StdEncoding.DecodeString(responseB64)
-	if err != nil {
-		return nil, fmt.Errorf("base64 decode: %w", err)
-	}
-	if len(framed) < 4 {
-		return nil, fmt.Errorf("response too short (%d bytes)", len(framed))
-	}
-	return framed[4:], nil
+	return string(out), nil
 }
 
-var broadcastDataRe = regexp.MustCompile(`data="([A-Za-z0-9+/=]+)"`)
-
-func parseBroadcastOutput(output string) (string, error) {
-	output = strings.TrimSpace(output)
-	if strings.Contains(output, "without waiting") {
-		return "", fmt.Errorf("broadcast sent async, ordered broadcast required: %s", output)
-	}
-
-	m := broadcastDataRe.FindStringSubmatch(output)
+// bundleString extracts a key from `content call` output, which prints the
+// returned Bundle as: Result: Bundle[{id=..., k=..., ...}]. Values are hex or
+// base64 (never contain commas or spaces), so a per-key match is unambiguous.
+// The \b anchor prevents "d" from matching inside "id=".
+func bundleString(output, key string) string {
+	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(key) + `=([A-Za-z0-9+/=_-]+)`)
+	m := re.FindStringSubmatch(output)
 	if m == nil {
-		return "", fmt.Errorf("no result data in broadcast output: %s", output)
+		return ""
 	}
-	return m[1], nil
+	return m[1]
 }
 
-func (b *BroadcastBackend) Enroll(application string, alg uint32, flags byte, label string, challenge []byte) (pubkey, keyHandle []byte, actualAlg uint32, attestationChain [][]byte, err error) {
+// decryptResponse opens an AES-256-GCM blob laid out as [12B nonce][ct][16B tag],
+// matching SessionCrypto.seal on the phone.
+func decryptResponse(key, data []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("aes: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("gcm: %w", err)
+	}
+	ns := gcm.NonceSize()
+	if len(data) < ns {
+		return nil, fmt.Errorf("ciphertext too short (%d bytes)", len(data))
+	}
+	pt, err := gcm.Open(nil, data[:ns], data[ns:], nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt: %w", err)
+	}
+	return pt, nil
+}
+
+func (b *ContentBackend) Enroll(application string, alg uint32, flags byte, label string, challenge []byte) (pubkey, keyHandle []byte, actualAlg uint32, attestationChain [][]byte, err error) {
 	appHash := sha256.Sum256([]byte(application))
 	labelBytes := []byte(label)
 
@@ -175,7 +237,7 @@ func (b *BroadcastBackend) Enroll(application string, alg uint32, flags byte, la
 	return pubkey, keyHandle, actualAlg, attestationChain, nil
 }
 
-func (b *BroadcastBackend) Sign(alg uint32, application string, keyHandle, data []byte, flags byte) (sigR, sigS []byte, counter uint32, respFlags byte, err error) {
+func (b *ContentBackend) Sign(alg uint32, application string, keyHandle, data []byte, flags byte) (sigR, sigS []byte, counter uint32, respFlags byte, err error) {
 	appHash := sha256.Sum256([]byte(application))
 	dataHash := sha256.Sum256(data)
 
@@ -236,7 +298,7 @@ type ResidentKey struct {
 	Flags  byte
 }
 
-func (b *BroadcastBackend) LoadResidentKeys() ([]ResidentKey, error) {
+func (b *ContentBackend) LoadResidentKeys() ([]ResidentKey, error) {
 	msg := []byte{msgSKLoadResidentRequest}
 	resp, err := b.SendMessage(msg, defaultTimeout)
 	if err != nil {

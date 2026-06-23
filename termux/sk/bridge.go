@@ -61,6 +61,34 @@ func sk_api_version() C.uint32_t {
 	return C.uint32_t(0x000a0000)
 }
 
+// cBytes copies b into a freshly C.malloc'd buffer, returning the pointer, its
+// length, and whether allocation succeeded. An empty slice yields (nil, 0, true)
+// so callers never take &b[0] on a zero-length slice (which panics across the
+// cgo boundary into OpenSSH).
+func cBytes(b []byte) (*C.uint8_t, C.size_t, bool) {
+	if len(b) == 0 {
+		return nil, 0, true
+	}
+	p := C.malloc(C.size_t(len(b)))
+	if p == nil {
+		return nil, 0, false
+	}
+	C.memcpy(p, unsafe.Pointer(&b[0]), C.size_t(len(b)))
+	return (*C.uint8_t)(p), C.size_t(len(b)), true
+}
+
+// freeResidentArray unwinds a partially built resident-key array: it frees the
+// first count populated entries and the array itself.
+func freeResidentArray(arr **C.struct_sk_resident_key, count int, ptrSize uintptr) {
+	for j := 0; j < count; j++ {
+		elemPtr := *(**C.struct_sk_resident_key)(unsafe.Pointer(
+			uintptr(unsafe.Pointer(arr)) + uintptr(j)*ptrSize,
+		))
+		sk_free_resident_key(elemPtr)
+	}
+	C.free(unsafe.Pointer(arr))
+}
+
 //export sk_enroll
 func sk_enroll(
 	alg C.uint32_t,
@@ -110,22 +138,22 @@ func sk_enroll(
 
 	resp.flags = flags
 
-	resp.public_key = (*C.uint8_t)(C.malloc(C.size_t(len(pubkey))))
-	if resp.public_key == nil {
+	pub, pubLen, ok := cBytes(pubkey)
+	if !ok {
 		C.free(unsafe.Pointer(resp))
 		return C.int(C.SSH_SK_ERR_GENERAL)
 	}
-	resp.public_key_len = C.size_t(len(pubkey))
-	C.memcpy(unsafe.Pointer(resp.public_key), unsafe.Pointer(&pubkey[0]), C.size_t(len(pubkey)))
+	resp.public_key = pub
+	resp.public_key_len = pubLen
 
-	resp.key_handle = (*C.uint8_t)(C.malloc(C.size_t(len(keyHandle))))
-	if resp.key_handle == nil {
+	handle, handleLen, ok := cBytes(keyHandle)
+	if !ok {
 		C.free(unsafe.Pointer(resp.public_key))
 		C.free(unsafe.Pointer(resp))
 		return C.int(C.SSH_SK_ERR_GENERAL)
 	}
-	resp.key_handle_len = C.size_t(len(keyHandle))
-	C.memcpy(unsafe.Pointer(resp.key_handle), unsafe.Pointer(&keyHandle[0]), C.size_t(len(keyHandle)))
+	resp.key_handle = handle
+	resp.key_handle_len = handleLen
 
 	resp.signature = nil
 	resp.signature_len = 0
@@ -135,16 +163,15 @@ func sk_enroll(
 	resp.authdata_len = 0
 
 	if len(attestationChain) > 0 {
-		leaf := attestationChain[0]
-		resp.attestation_cert = (*C.uint8_t)(C.malloc(C.size_t(len(leaf))))
-		if resp.attestation_cert == nil {
+		cert, certLen, ok := cBytes(attestationChain[0])
+		if !ok {
 			C.free(unsafe.Pointer(resp.key_handle))
 			C.free(unsafe.Pointer(resp.public_key))
 			C.free(unsafe.Pointer(resp))
 			return C.int(C.SSH_SK_ERR_GENERAL)
 		}
-		resp.attestation_cert_len = C.size_t(len(leaf))
-		C.memcpy(unsafe.Pointer(resp.attestation_cert), unsafe.Pointer(&leaf[0]), C.size_t(len(leaf)))
+		resp.attestation_cert = cert
+		resp.attestation_cert_len = certLen
 
 		if len(attestationChain) > 1 {
 			intermediates := attestationChain[1:]
@@ -161,16 +188,16 @@ func sk_enroll(
 				copy(authBuf[aOff:], c)
 				aOff += len(c)
 			}
-			resp.authdata = (*C.uint8_t)(C.malloc(C.size_t(len(authBuf))))
-			if resp.authdata == nil {
+			authData, authLen, ok := cBytes(authBuf)
+			if !ok {
 				C.free(unsafe.Pointer(resp.attestation_cert))
 				C.free(unsafe.Pointer(resp.key_handle))
 				C.free(unsafe.Pointer(resp.public_key))
 				C.free(unsafe.Pointer(resp))
 				return C.int(C.SSH_SK_ERR_GENERAL)
 			}
-			resp.authdata_len = C.size_t(len(authBuf))
-			C.memcpy(unsafe.Pointer(resp.authdata), unsafe.Pointer(&authBuf[0]), C.size_t(len(authBuf)))
+			resp.authdata = authData
+			resp.authdata_len = authLen
 		}
 	}
 
@@ -224,23 +251,23 @@ func sk_sign(
 	resp.flags = C.uint8_t(respFlags)
 	resp.counter = C.uint32_t(counter)
 
-	resp.sig_r = (*C.uint8_t)(C.malloc(C.size_t(len(sigR))))
-	if resp.sig_r == nil {
+	sr, srLen, ok := cBytes(sigR)
+	if !ok {
 		C.free(unsafe.Pointer(resp))
 		return C.int(C.SSH_SK_ERR_GENERAL)
 	}
-	resp.sig_r_len = C.size_t(len(sigR))
-	C.memcpy(unsafe.Pointer(resp.sig_r), unsafe.Pointer(&sigR[0]), C.size_t(len(sigR)))
+	resp.sig_r = sr
+	resp.sig_r_len = srLen
 
 	if sigS != nil {
-		resp.sig_s = (*C.uint8_t)(C.malloc(C.size_t(len(sigS))))
-		if resp.sig_s == nil {
+		ss, ssLen, ok := cBytes(sigS)
+		if !ok {
 			C.free(unsafe.Pointer(resp.sig_r))
 			C.free(unsafe.Pointer(resp))
 			return C.int(C.SSH_SK_ERR_GENERAL)
 		}
-		resp.sig_s_len = C.size_t(len(sigS))
-		C.memcpy(unsafe.Pointer(resp.sig_s), unsafe.Pointer(&sigS[0]), C.size_t(len(sigS)))
+		resp.sig_s = ss
+		resp.sig_s_len = ssLen
 	} else {
 		resp.sig_s = nil
 		resp.sig_s_len = 0
@@ -294,6 +321,7 @@ func sk_load_resident_keys(
 	for i, k := range keys {
 		rk := (*C.struct_sk_resident_key)(C.calloc(1, C.size_t(C.sizeof_struct_sk_resident_key)))
 		if rk == nil {
+			freeResidentArray(arr, i, ptrSize)
 			return C.int(C.SSH_SK_ERR_GENERAL)
 		}
 
@@ -303,14 +331,29 @@ func sk_load_resident_keys(
 		rk.flags = C.uint8_t(k.Flags)
 		rk.user_id = nil
 		rk.user_id_len = 0
-
 		rk.key.flags = C.uint8_t(k.Flags)
-		rk.key.public_key = (*C.uint8_t)(C.malloc(C.size_t(len(k.PubKey))))
-		rk.key.public_key_len = C.size_t(len(k.PubKey))
-		C.memcpy(unsafe.Pointer(rk.key.public_key), unsafe.Pointer(&k.PubKey[0]), C.size_t(len(k.PubKey)))
-		rk.key.key_handle = (*C.uint8_t)(C.malloc(C.size_t(len(k.Handle))))
-		rk.key.key_handle_len = C.size_t(len(k.Handle))
-		C.memcpy(unsafe.Pointer(rk.key.key_handle), unsafe.Pointer(&k.Handle[0]), C.size_t(len(k.Handle)))
+
+		pub, pubLen, ok := cBytes(k.PubKey)
+		if !ok {
+			C.free(unsafe.Pointer(rk.application))
+			C.free(unsafe.Pointer(rk))
+			freeResidentArray(arr, i, ptrSize)
+			return C.int(C.SSH_SK_ERR_GENERAL)
+		}
+		rk.key.public_key = pub
+		rk.key.public_key_len = pubLen
+
+		handle, handleLen, ok := cBytes(k.Handle)
+		if !ok {
+			C.free(unsafe.Pointer(rk.key.public_key))
+			C.free(unsafe.Pointer(rk.application))
+			C.free(unsafe.Pointer(rk))
+			freeResidentArray(arr, i, ptrSize)
+			return C.int(C.SSH_SK_ERR_GENERAL)
+		}
+		rk.key.key_handle = handle
+		rk.key.key_handle_len = handleLen
+
 		rk.key.signature = nil
 		rk.key.signature_len = 0
 		rk.key.attestation_cert = nil

@@ -75,6 +75,17 @@ class SessionCrypto private constructor(private val key: ByteArray) {
         }
 
         /**
+         * Wrap a raw symmetric key (e.g. a per-request key generated for the
+         * Termux content-provider channel) in a [SessionCrypto] so the exact
+         * same [seal]/[open] wire format is reused. [key] must be 32 bytes for
+         * AES-256.
+         */
+        fun withRawKey(key: ByteArray): SessionCrypto {
+            require(key.size == 32) { "AES-256 key must be 32 bytes, got ${key.size}" }
+            return SessionCrypto(key)
+        }
+
+        /**
          * HKDF-SHA256 single-block extract+expand (RFC 5869).
          * Expand inputs HMAC(PRK, info || 0x01); the trailing counter byte is
          * appended here so callers pass only the semantic `info` bytes.
