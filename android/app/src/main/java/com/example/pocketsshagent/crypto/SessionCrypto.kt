@@ -31,7 +31,7 @@ class SessionCrypto private constructor(private val key: ByteArray) {
 
         // SubjectPublicKeyInfo header for X25519 (RFC 8410, OID 1.3.101.110)
         // 30 2a 30 05 06 03 2b 65 6e 03 21 00
-        private val X25519_SPKI_HEADER = byteArrayOf(
+        val X25519_SPKI_HEADER = byteArrayOf(
             0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00
         )
 
@@ -79,7 +79,7 @@ class SessionCrypto private constructor(private val key: ByteArray) {
          * Expand inputs HMAC(PRK, info || 0x01); the trailing counter byte is
          * appended here so callers pass only the semantic `info` bytes.
          */
-        private fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
+        internal fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
             val mac = Mac.getInstance("HmacSHA256")
             mac.init(SecretKeySpec(salt, "HmacSHA256"))
             val prk = mac.doFinal(ikm)
@@ -89,6 +89,24 @@ class SessionCrypto private constructor(private val key: ByteArray) {
             mac2.update(info)
             mac2.update(byteArrayOf(0x01))
             return mac2.doFinal()
+        }
+
+        fun sealWithKey(key: ByteArray, plaintext: ByteArray): ByteArray {
+            val nonce = ByteArray(NONCE_BYTES).also { SecureRandom().nextBytes(it) }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(TAG_BITS, nonce))
+            return nonce + cipher.doFinal(plaintext)
+        }
+
+        fun openWithKey(key: ByteArray, data: ByteArray): ByteArray {
+            require(data.size >= NONCE_BYTES + TAG_BITS / 8) { "Ciphertext too short: ${data.size} bytes" }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(key, "AES"),
+                GCMParameterSpec(TAG_BITS, data, 0, NONCE_BYTES)
+            )
+            return cipher.doFinal(data, NONCE_BYTES, data.size - NONCE_BYTES)
         }
     }
 

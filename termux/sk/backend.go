@@ -37,7 +37,12 @@ func getBackend() *BroadcastBackend {
 }
 
 func (b *BroadcastBackend) SendMessage(msg []byte, timeout time.Duration) ([]byte, error) {
+	session, clientPubRaw, err := NewTermuxSession()
+	if err != nil {
+		return nil, fmt.Errorf("session init: %w", err)
+	}
 	requestB64 := base64.StdEncoding.EncodeToString(msg)
+	clientDhB64 := base64.StdEncoding.EncodeToString(clientPubRaw)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -45,7 +50,8 @@ func (b *BroadcastBackend) SendMessage(msg []byte, timeout time.Duration) ([]byt
 	cmd := exec.CommandContext(ctx, "/system/bin/am", "broadcast",
 		"--user", "0",
 		"-n", "com.example.pocketsshagent/.termux.AgentReceiver",
-		"--es", "msg", requestB64)
+		"--es", "msg", requestB64,
+		"--es", "dh", clientDhB64)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -64,14 +70,27 @@ func (b *BroadcastBackend) SendMessage(msg []byte, timeout time.Duration) ([]byt
 		return nil, err
 	}
 
-	framed, err := base64.StdEncoding.DecodeString(responseB64)
+	raw, err := base64.StdEncoding.DecodeString(responseB64)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode: %w", err)
 	}
-	if len(framed) < 4 {
-		return nil, fmt.Errorf("response too short (%d bytes)", len(framed))
+	if len(raw) < 32+28 {
+		return nil, fmt.Errorf("response too short (%d bytes)", len(raw))
 	}
-	return framed[4:], nil
+	serverPubRaw := raw[:32]
+	encrypted := raw[32:]
+
+	if err := session.DeriveKey(serverPubRaw); err != nil {
+		return nil, fmt.Errorf("derive key: %w", err)
+	}
+	plaintext, err := session.Open(encrypted)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt: %w", err)
+	}
+	if len(plaintext) < 4 {
+		return nil, fmt.Errorf("plaintext too short (%d bytes)", len(plaintext))
+	}
+	return plaintext[4:], nil
 }
 
 var broadcastDataRe = regexp.MustCompile(`data="([A-Za-z0-9+/=]+)"`)

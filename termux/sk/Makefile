@@ -5,7 +5,7 @@ TARGET = libpocket-sk.so
 
 all: $(TARGET)
 
-$(TARGET): bridge.go backend.go
+$(TARGET): bridge.go backend.go session.go
 	@echo "Building PocketSSH SK provider (Termux)..."
 	CGO_ENABLED=1 $(GO) build -buildmode=c-shared -o $(TARGET) .
 	@echo "Built: $(TARGET)"
